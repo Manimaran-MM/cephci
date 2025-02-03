@@ -1475,13 +1475,17 @@ def fetch_build_artifacts(build, ceph_version, platform, upstream_build=None):
         if build == "upstream":
             version = str(upstream_build).upper() if upstream_build else "MAIN"
             filename = f"UPSTREAM-{version}.yaml"
-
+        print("Debug", filename)
+        log.info(f"Debug: {filename}")
         url = f"{recipe_url}{filename}"
+        log.info(f"URL: {url}")
         data = requests.get(url, verify=False)
+        log.info(f"data: {data}")
         yml_data = yaml.safe_load(data.text)
+        log.info(f"data: {yml_data}")
 
         build_info = yml_data["latest"] if build == "upstream" else yml_data[build]
-
+        log.info(build_info)
         container_image = build_info["repository"]
 
         registry, image_name = container_image.split(":")[0].split("/", 1)
