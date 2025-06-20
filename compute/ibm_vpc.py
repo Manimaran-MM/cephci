@@ -34,17 +34,14 @@ LOG = Log(__name__)
 def get_ibm_service(access_key: str, service_url: str):
     """
     Return the authenticated connection from the given service_url.
-
     Args:
         access_key (str):   The access key(API key) of the user.
         service_url (str):  VPC endpoint to be used for provisioning.
     """
     authenticator = IAMAuthenticator(access_key)
-
     service = VpcV1(authenticator=authenticator)
     service.set_service_url(service_url=service_url)
     service.set_http_config({"timeout": 130})  # Increase to 130s
-
     return service
 
 
@@ -58,24 +55,19 @@ def get_dns_service(
         accessKey    The access key(API key) of the user.
     """
     authenticator = IAMAuthenticator(access_key)
-
     dnssvc = DnsSvcsV1(authenticator=authenticator)
     dnssvc.set_service_url(service_url=service_url)
-
     return dnssvc
 
 
 def get_resource_id(resource_name: str, response: Dict) -> str:
     """
     Retrieve the ID of the given resource from the provided response.
-
     Args:
         resource_name (str):    Name of the resource.
         response (Dict):        DetailedResponse returned from the collections.
-
     Returns:
         Resource id (str)
-
     Raises:
         ResourceNotFound    when there is a failure to retrieve the ID.
     """
@@ -85,38 +77,30 @@ def get_resource_id(resource_name: str, response: Dict) -> str:
 def get_resource_details(resource_name: str, response: Dict) -> Dict:
     """
     Returns the details for the provided resource_name from the given collection.
-
     Args:
         resource_name (str):    Name of the resource.
         response (Dict):        DetailedResponse returned from the collections.
-
     Returns:
         Resource id (str)
-
     Raises:
         ResourceNotFound    when there is a failure to retrieve the ID.
     """
     resource_url = response["first"]["href"]
     resource_list_name = re.search(r"v1/(.*?)\?", resource_url).group(1)
-
     for i in response[resource_list_name]:
         if i["name"] == resource_name:
             return i
-
     raise ResourceNotFound(f"Failed to retrieve the ID of {resource_name}.")
 
 
 def get_dns_zone_id(zone_name: str, response: Any) -> str:
     """
     Retrieve the DNS Zone ID for the provided zone name using the provided response.
-
     Args:
         zone_name (str):    DNS Zone whose ID needs to be retrieved.
         response (Dict):    Response returned from the collection.
-
     Returns:
         DNS Zone ID (str)
-
     Raises:
         ResourceNotFound    when there is a failure to retrieve the given zone ID.
     """
@@ -129,14 +113,11 @@ def get_dns_zone_id(zone_name: str, response: Any) -> str:
 def get_dns_zone_instance_id(zone_name: str, response: Any) -> str:
     """
     Retrieve the DNS Zone Instance ID for the provided zone name using the provided response.
-
     Args:
         zone_name (str):    DNS Zone whose ID needs to be retrieved.
         response (Dict):    Response returned from the collection.
-
     Returns:
         DNS Zone Instance ID (str)
-
     Raises:
         ResourceNotFound    when there is a failure to retrieve the given zone ID.
     """
@@ -157,7 +138,6 @@ class CephVMNodeIBM:
     ) -> None:
         """
         Initializes the instance using the provided information.
-
         Args:
             os_cred_ibm (dict): Dictionary containing 'accesskey' and 'service_url'.
             vsi_id (str):       The VSI node ID to be retrieved
@@ -168,44 +148,33 @@ class CephVMNodeIBM:
         self._subnet: str = ""
         self._roles: list = list()
         self.node = None
-
         self.service = get_ibm_service(
             access_key=os_cred_ibm["accesskey"], service_url=os_cred_ibm["service_url"]
         )
         self.dns_service = get_dns_service(access_key=os_cred_ibm["accesskey"])
-
         if vsi_id:
             self.node = self.service.get_instance(id=vsi_id).get_result()
-
         if node:
             self.node = node
 
     # properties
-
     @property
     def ip_address(self) -> str:
         """Return the private IP address of the node."""
-        return self.node["primary_network_interface"]["primary_ip"]["address"]
+        return self.node["primary_network_interface"]["primary_ipv4_address"]
 
     @property
     def floating_ips(self) -> List[str]:
         """Return the list of floating IP's"""
         if not self.node:
             return []
-
         resp = self.service.list_instance_network_interface_floating_ips(
             instance_id=self.node["id"],
             network_interface_id=self.node["primary_network_interface"]["id"],
         )
-
         return [
             x["address"] for x in resp.get("floating_ips") if x["status"] == "available"
         ]
-
-    @property
-    def public_ip_address(self) -> str:
-        """Return the public IP address of the node."""
-        return self.floating_ips[0]
 
     @property
     def hostname(self) -> str:
@@ -214,17 +183,13 @@ class CephVMNodeIBM:
         while end_time > datetime.now():
             try:
                 name, _, _ = socket.gethostbyaddr(self.ip_address)
-
                 if name is not None:
                     return name
-
             except socket.herror:
                 break
             except BaseException as be:  # noqa
                 LOG.warning(be)
-
             sleep(5)
-
         return self.node["name"]
 
     @property
@@ -232,7 +197,6 @@ class CephVMNodeIBM:
         """Return the list of storage volumes attached to the node."""
         if self.node is None:
             return []
-
         # Removing boot volume from the list
         volume_attachments = []
         for vol in self.node["volume_attachments"]:
@@ -246,11 +210,9 @@ class CephVMNodeIBM:
         """Return the subnet information."""
         if self._subnet:
             return self._subnet
-
         subnet_details = self.service.get_subnet(
             self.node["primary_network_interface"]["subnet"]["id"]
         )
-
         return subnet_details.get_result()["ipv4_cidr_block"]
 
     @property
@@ -297,7 +259,6 @@ class CephVMNodeIBM:
     ) -> None:
         """
         Create the instance in IBM Cloud with the provided data.
-
         Args:
             node_name           Name of the VM.
             image_name          Name of the image to use for creating the VM.
@@ -314,7 +275,6 @@ class CephVMNodeIBM:
             size_of_disks       size of disk
             no_of_volumes       Number of volumes for each node
             userdata            user related data
-
         """
         LOG.info(f"Starting to create VM with name {node_name}")
         try:
@@ -322,18 +282,15 @@ class CephVMNodeIBM:
             vpcs = self.service.list_vpcs()
             vpc_id = get_resource_id(vpc_name, vpcs.get_result())
             vpc_identity_model = dict({"id": vpc_id})
-
             subnets = self.service.list_subnets()
             subnet = get_resource_details(network_name, subnets.get_result())
             subnet_identity_model = dict({"id": subnet["id"]})
             self._subnet = subnet["ipv4_cidr_block"]
-
             security_group = self.service.list_security_groups()
             security_group_id = get_resource_id(
                 group_access, security_group.get_result()
             )
             security_group_identity_model = dict({"id": security_group_id})
-
             # Construct a dict representation of a NetworkInterfacePrototype model
             network_interface_prototype_model = dict(
                 {
@@ -342,35 +299,27 @@ class CephVMNodeIBM:
                     "security_groups": [security_group_identity_model],
                 }
             )
-
             # Construct a dict representation of a ImageIdentityById model
             images = self.service.list_images(name=image_name)
             image_id = get_resource_id(image_name, images.get_result())
             image_identity_model = dict({"id": image_id})
-
             # Construct a dict representation of a KeyIdentityById model
             keys = self.service.list_keys()
             key_id = get_resource_id(private_key, keys.get_result())
-
             key_identity_model = dict({"id": key_id})
             # SSH fingerprint of ceph-qe-sa.pub - ssh-keygen -lf ceph-qe-sa.pub
             key_identity_shared = {
                 "fingerprint": "SHA256:SFan4TdEd1xcT4v9So8q4A+B/f2PcXOoPfS2vwPk9/M"
             }
-
             # Construct a dict representation of a ResourceIdentityById model
             # ToDo: Move this information to credentials... resource groups.
             resource_group_identity_model = dict({"id": resource_group_id})
-
             # Construct a dict representation of a InstanceProfileIdentityByName model
             instance_profile_identity_model = dict({"name": profile})
-
             # Construct a dict representation of a ZoneIdentityByName model
             zone_identity_model = dict({"name": zone_id_model_name})
-
             # Construct a dict representation of a VolumeProfileIdentityByName model
             volume_profile_identity_model = dict({"name": "general-purpose"})
-
             volume_attachment_list = []
             for i in range(0, no_of_volumes):
                 volume_attachment_volume_prototype_instance_context_model1 = dict(
@@ -380,23 +329,19 @@ class CephVMNodeIBM:
                         "capacity": size_of_disks,
                     }
                 )
-
                 volume_attachment_prototype_instance_context_model1 = dict(
                     {
                         "delete_volume_on_instance_delete": True,
                         "volume": volume_attachment_volume_prototype_instance_context_model1,
                     }
                 )
-
                 volume_attachment_list.append(
                     volume_attachment_prototype_instance_context_model1
                 )
-
             # Prepare the VSI payload
             instance_prototype_model = dict(
                 {"keys": [key_identity_model, key_identity_shared]}
             )
-
             instance_prototype_model["name"] = node_name.lower()
             instance_prototype_model["profile"] = instance_profile_identity_model
             instance_prototype_model["resource_group"] = resource_group_identity_model
@@ -408,22 +353,17 @@ class CephVMNodeIBM:
                 network_interface_prototype_model
             )
             instance_prototype_model["zone"] = zone_identity_model
-
             # Set up parameter values
             instance_prototype = instance_prototype_model
             response = self.service.create_instance(instance_prototype)
-
             instance_id = response.get_result()["id"]
             self._wait_until_vm_state(instance_id, target_state="running")
-
             response = self.service.get_instance(instance_id)
             self.node = response.get_result()
-
             # DNS record creation phase
             LOG.debug(f"Adding DNS records for {node_name}")
             dns_zone = self.dns_service.list_dnszones(dns_svc_id)
             dns_zone_id = get_dns_zone_id(zone_name, dns_zone.get_result())
-
             resource = self.dns_service.list_resource_records(
                 instance_id=dns_svc_id,
                 dnszone_id=dns_zone_id,
@@ -435,7 +375,7 @@ class CephVMNodeIBM:
                 i
                 for i in records_a
                 if i["rdata"]["ip"]
-                == self.node["primary_network_interface"]["primary_ip"]["address"]
+                == self.node["primary_network_interface"]["primary_ipv4_address"]
             ]
             if records_ip:
                 self.dns_service.update_resource_record(
@@ -445,9 +385,8 @@ class CephVMNodeIBM:
                     name=self.node["name"],
                     rdata=records_ip[0]["rdata"],
                 )
-
             a_record = ResourceRecordInputRdataRdataARecord(
-                self.node["primary_network_interface"]["primary_ip"]["address"]
+                self.node["primary_network_interface"]["primary_ipv4_address"]
             )
             self.dns_service.create_resource_record(
                 instance_id=dns_svc_id,
@@ -457,7 +396,6 @@ class CephVMNodeIBM:
                 name=self.node["name"],
                 rdata=a_record,
             )
-
             ptr_record = ResourceRecordInputRdataRdataPtrRecord(
                 f"{self.node['name']}.{zone_name}"
             )
@@ -466,10 +404,9 @@ class CephVMNodeIBM:
                 dnszone_id=dns_zone_id,
                 type="PTR",
                 ttl=900,
-                name=self.node["primary_network_interface"]["primary_ip"]["address"],
+                name=self.node["primary_network_interface"]["primary_ipv4_address"],
                 rdata=ptr_record,
             )
-
         except NodeError:
             raise
         except BaseException as be:  # noqa
@@ -483,28 +420,22 @@ class CephVMNodeIBM:
     ) -> None:
         """
         Removes the VSI instance from the platform along with its DNS record.
-
         Args:
             zone_name (str):    DNS Zone name associated with the instance.
         """
         if not self.node:
             return
-
         node_id = self.node["id"]
         node_name = self.node["name"]
-
         try:
             self.remove_dns_records(zone_name, dns_svc_id)
         except BaseException:  # noqa
             LOG.warning(f"Encountered an error in removing DNS records of {node_name}")
-
         LOG.info(f"Preparing to remove {node_name}")
         resp = self.service.delete_instance(node_id)
-
         if resp.get_status_code() != 204:
             LOG.debug(f"{node_name} cannot be found.")
             return
-
         # Wait for the VM to be delete
         end_time = datetime.now() + timedelta(seconds=600)
         while end_time > datetime.now():
@@ -518,7 +449,6 @@ class CephVMNodeIBM:
                 LOG.info(f"Successfully removed {node_name}")
                 self.remove_dns_records(zone_name, dns_svc_id)
                 return
-
         LOG.debug(resp.get_result())
         raise NodeDeleteFailure(f"Failed to remove {node_name}")
 
@@ -578,19 +508,15 @@ class CephVMNodeIBM:
     ) -> None:
         """
         Waits until the VSI moves to a running state within the specified time.
-
         Args:
             instance_id (str)   The ID of the VSI to be checked.
-
         Returns:
             None
-
         Raises:
             NodeError
         """
         start_time = datetime.now()
         end_time = start_time + timedelta(seconds=timeout)
-
         node_details = None
         while end_time > datetime.now():
             sleep(5)
@@ -599,7 +525,6 @@ class CephVMNodeIBM:
                 LOG.debug("Encountered an error getting the instance.")
                 sleep(5)
                 continue
-
             node_details = resp.get_result()
             if node_details["status"] == target_state:
                 end_time = datetime.now()
@@ -611,33 +536,27 @@ class CephVMNodeIBM:
                     int(duration),
                 )
                 return
-
             if node_details["status"] == "failed":
                 raise NodeError(node_details["status_reasons"])
-
         raise NodeError(f"{node_details['name']} is in {node_details['status']} state.")
 
     @retry(ConnectionError, tries=3, delay=60)
     def remove_dns_records(self, zone_name, dns_svc_id):
         """
         Remove the DNS records associated this VSI.
-
         Args:
             zone_name (str):    DNS zone name associated with this VSI
             dns_svc_id (str):   GUID of the DNS Service.
         """
         if not self.node:
             return
-
         zones = self.dns_service.list_dnszones(dns_svc_id)
         zone_id = get_dns_zone_id(zone_name, zones.get_result())
         zone_instance_id = get_dns_zone_instance_id(zone_name, zones.get_result())
-
         resp = self.dns_service.list_resource_records(
             instance_id=zone_instance_id, dnszone_id=zone_id
         )
         records = resp.get_result()
-
         # ToDo: There is a maximum of 200 records that can be retrieved at a time.
         #       Support pagination is required.
         for record in records["resource_records"]:
@@ -651,16 +570,13 @@ class CephVMNodeIBM:
                         dnszone_id=zone_id,
                         record_id=record["linked_ptr_record"]["id"],
                     )
-
                 LOG.info(f"Deleting Address record {record['name']}")
                 self.dns_service.delete_resource_record(
                     instance_id=dns_svc_id,
                     dnszone_id=zone_id,
                     record_id=record["id"],
                 )
-
                 return
-
         # This code path can happen if there are no matching/associated DNS records
         # Or we have a problem
         LOG.debug(f"No matching DNS records found for {self.node['name']}")
