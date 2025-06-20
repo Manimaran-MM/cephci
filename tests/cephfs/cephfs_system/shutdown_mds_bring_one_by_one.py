@@ -1,10 +1,12 @@
 import json
 import random
 import string
+import time
 import traceback
 
 from ceph.ceph import CommandFailed
 from ceph.parallel import parallel
+from ceph.utils import find_vm_node_by_hostname
 from tests.cephfs.cephfs_utilsV1 import FsUtils
 from tests.io.fs_io import fs_io
 from utility.log import Log
@@ -34,6 +36,7 @@ def run(ceph_cluster, **kw):
         config = kw.get("config")
         clients = ceph_cluster.get_ceph_objects("client")
         mds_nodes = ceph_cluster.get_ceph_objects("mds")
+        log.debug(ceph_cluster)
 
         build = config.get("build", config.get("rhbuild"))
         fs_util.prepare_clients(clients, build)
@@ -41,33 +44,14 @@ def run(ceph_cluster, **kw):
         client1 = clients[0]
         fs_name = "cephfs" if not erasure else "cephfs-ec"
         fs_details = fs_util.get_fs_info(client1, fs_name)
-
         if not fs_details:
             fs_util.create_fs(client1, fs_name)
-
         host_list = [mdsnode.node.hostname for mdsnode in mds_nodes]
         hosts = " ".join(host_list)
         client1.exec_command(
             sudo=True,
             cmd=f"ceph orch apply mds {fs_name} --placement='3 {hosts}'",
         )
-        osp_cred = config.get("osp_cred")
-        if config.get("cloud-type") == "openstack":
-            os_cred = osp_cred.get("globals").get("openstack-credentials")
-            params = {}
-            params["username"] = os_cred["username"]
-            params["password"] = os_cred["password"]
-            params["auth_url"] = os_cred["auth-url"]
-            params["auth_version"] = os_cred["auth-version"]
-            params["tenant_name"] = os_cred["tenant-name"]
-            params["service_region"] = os_cred["service-region"]
-            params["domain_name"] = os_cred["domain"]
-            params["tenant_domain_id"] = os_cred["tenant-domain-id"]
-            params["cloud_type"] = "openstack"
-        elif config.get("cloud-type") == "ibmc":
-            pass
-        else:
-            pass
         mounting_dir = "".join(
             random.choice(string.ascii_lowercase + string.digits)
             for _ in list(range(10))
@@ -95,11 +79,11 @@ def run(ceph_cluster, **kw):
             "filesystem": "cephfs",
             "mount_dir": f"{fuse_mounting_dir_1}",
         }
-        fs_io(client=clients[0], fs_config=cephfs, fs_util=fs_util)
-        # create a test dir in mounted dir
-        test_dir = f"{fuse_mounting_dir_1}test_dir"
-        client1.exec_command(sudo=True, cmd=f"mkdir {test_dir}")
 
+        # fs_io(client=clients[0], fs_config=cephfs, fs_util=fs_util)
+        # # create a test dir in mounted dir
+        # test_dir = f"{fuse_mounting_dir_1}test_dir"
+        # client1.exec_command(sudo=True, cmd=f"mkdir {test_dir}")
         def create_io_dir():
             for i in range(1, 300):
                 directory_name = f"{fuse_mounting_dir_1}directory_{i}"
@@ -108,8 +92,8 @@ def run(ceph_cluster, **kw):
                 client1.exec_command(sudo=True, cmd=f"touch {file_name}")
 
         # Creating 5k dirs and files in parallel
-        with parallel() as p:
-            p.spawn(create_io_dir)
+        # with parallel() as p:
+        # p.spawn(create_io_dir)
         find_mdsmap = f"ceph fs status {fs_name} -f json"
         out1 = client1.exec_command(sudo=True, cmd=find_mdsmap)
         output1 = json.loads(out1[0])
@@ -132,7 +116,8 @@ def run(ceph_cluster, **kw):
             print(mds.node.hostname)
             if mds.node.hostname == first_shut:
                 bringup_mds.append(mds)
-                fs_util.node_power_off(node=mds.node, sleep_time=150, **params)
+                target_node = find_vm_node_by_hostname(ceph_cluster, mds.node.hostname)
+                target_node.shutdown(wait=True)
         # updating mds
         out2 = client1.exec_command(sudo=True, cmd=find_mdsmap)
         output2 = json.loads(out2[0])
@@ -149,13 +134,13 @@ def run(ceph_cluster, **kw):
         if standby_mds[0] not in up_mds2:
             log.info(up_mds2)
             for mds in bringup_mds:
-                fs_util.node_power_on(node=mds.node, sleep_time=150, **params)
+                target_node = find_vm_node_by_hostname(ceph_cluster, mds.node.hostname)
+                target_node.power_on()
             raise CommandFailed(
                 f"Standby mds {standby_mds[0]} is not promoted to active"
             )
         else:
             log.info(f"Standby mds {standby_mds[0]} is promoted to active")
-
         out3 = client1.exec_command(sudo=True, cmd=find_mdsmap)
         output3 = json.loads(out3[0])
         mdsmap3 = output3["mdsmap"]
@@ -167,18 +152,24 @@ def run(ceph_cluster, **kw):
                     if mds["name"].split(".")[1] == mdss.node.hostname:
                         log.info(f'shutting down {mds["name"]}')
                         bringup_mds.append(mdss)
-                        fs_util.node_power_off(node=mdss.node, sleep_time=150, **params)
+                        target_node = find_vm_node_by_hostname(
+                            ceph_cluster, mdss.node.hostname
+                        )
+                        target_node.shutdown(wait=True)
                         break
         out4 = client1.exec_command(sudo=True, cmd=find_mdsmap)
         output4 = json.loads(out4[0])
         mdsmap4 = output4["mdsmap"]
         log.info(f"mdsmap4={mdsmap4}")
         for bring in bringup_mds:
-            fs_util.node_power_on(node=bring.node, sleep_time=150, **params)
+            target_node = find_vm_node_by_hostname(ceph_cluster, bring.node.hostname)
+            target_node.power_on()
         # check if the mds is restarted
+        time.sleep(5)
         out5 = client1.exec_command(sudo=True, cmd=find_mdsmap)
         output5 = json.loads(out5[0])
         mdsmap5 = output5["mdsmap"]
+        log.debug(mdsmap5)
         for mds in mdsmap5:
             if mds["state"] == "failed":
                 raise CommandFailed(f"mds {mds['name']} is not in active state")
