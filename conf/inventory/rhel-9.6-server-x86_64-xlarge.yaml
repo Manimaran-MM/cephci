@@ -3,7 +3,7 @@ version_id: 9.6
 id: rhel
 instance:
   create:
-    image-name: RHEL-9.6.0-x86_64-ga-latest
+    image-name: RHEL-9.6.0-x86_64-nightly-latest
     vm-size: ci.standard.xl
 
   setup: |
