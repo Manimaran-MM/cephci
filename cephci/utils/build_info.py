@@ -18,6 +18,7 @@ class CephTestManifest:
 
     URI: str = (
         "https://raw.githubusercontent.com/ibmstorage/qe-ceph-manifest/refs/heads/main/"
+        # "http://magna002.ceph.redhat.com/ceph-qe-logs/manim/repo/"
     )
     SUPPORTED_PRODUCTS = ["community", "redhat", "ibm"]
     RELEASE_MAP = {"reef": 7, "squid": 8, "tentacle": 9}

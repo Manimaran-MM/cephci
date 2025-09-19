@@ -59,7 +59,7 @@ def run(ceph_cluster, **kw):
             for cnode in ceph_nodes:
                 cnode.exec_command(
                     sudo=True,
-                    cmd=f"echo -e '[rh_add_repo]\nbaseurl={url}\ngpgcheck=0\nenabled=1\n"
+                    cmd=f"echo -e '[rh_add_repo]\nbaseurl={url}\ngpgcheck=0\nenabled=1\npriority=1\n"
                     f"name=Add Repo' > /etc/yum.repos.d/rh_add_repo.repo",
                 )
                 kernel_version, _ = cnode.exec_command(sudo=True, cmd="uname -r")
@@ -93,7 +93,8 @@ def run(ceph_cluster, **kw):
             return 0
         elif "post" in verification_type:
             log.info(url)
-            kernel_cmds = ["rpm", "-ivh"]
+            # kernel_cmds = ["rpm", "-ivh"]
+            kernel_cmds = ["yum", "install", "--nogpgcheck", "-y"]
             if "rhel-8" in url:
                 kernel_package = url.split("/")[-1]
                 url = url.strip(kernel_package)
@@ -119,6 +120,7 @@ def run(ceph_cluster, **kw):
                 kernel_modules_package = "kernel-modules" + kernel_package.strip(
                     "kernel"
                 )
+                kernel_modules_extra_package = "kernel-modules-extra" + kernel_package.strip("kernel")
                 log.info(url + kernel_modules_core)
                 log.info(url + kernel_core_package)
                 log.info(url + kernel_modules_package)
@@ -127,6 +129,7 @@ def run(ceph_cluster, **kw):
                 kernel_cmds.append(url + kernel_core_package)
                 kernel_cmds.append(url + kernel_modules_package)
                 kernel_cmds.append(url + kernel_package)
+                kernel_cmds.append(url + kernel_modules_extra_package)
             kernel_update_cmd = " ".join(kernel_cmds).replace("\n", "")
             for cnode in ceph_nodes:
                 kernel_version, _ = cnode.exec_command(sudo=True, cmd="uname -r")

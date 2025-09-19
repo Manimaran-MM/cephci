@@ -1,17 +1,16 @@
 ---
-version_id: 9.4
+version_id: 8.8
 id: rhel
 instance:
   create:
-    image-name: RHEL-9.4.0-x86_64-nightly-latest
-    vm-size: ci.standard.xl
+    image-name: RHEL-8.8.0-x86_64-ga-latest
+    vm-size: ci.standard.medium
 
   setup: |
     #cloud-config
 
     ssh_pwauth: true
     disable_root: false
-
     groups:
       - cephuser
 
