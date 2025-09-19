@@ -19,7 +19,11 @@ from cli.utilities.utils import (
     set_service_state,
 )
 from utility.log import Log
-from utility.utils import get_cephci_config, is_unsecured_registry
+from utility.utils import (
+    get_cephci_config,
+    is_kernel_update_custom_config,
+    is_unsecured_registry,
+)
 
 log = Log(__name__)
 
@@ -199,6 +203,8 @@ def install_prereq(
             cmd="sudo apt-get install -y " + deb_all_packages, long_running=True
         )
     else:
+        skip_kernel_workflow = is_kernel_update_custom_config(test_data)
+
         if distro_ver.startswith("7"):
             ceph.exec_command(cmd="sudo systemctl restart NetworkManager.service")
 
@@ -222,13 +228,32 @@ def install_prereq(
         if repo:
             setup_addition_repo(ceph, repo)
 
-        ceph.exec_command(cmd="sudo yum -y upgrade", timeout=600, check_ec=False)
+        if _is_beta_rhel(ceph.distro_info):
+            _enable_beta_compose_repos(ceph, distro_ver)
+            ceph.exec_command(sudo=True, cmd="dnf clean all", check_ec=False)
 
-        rpm_all_packages = " ".join(rpm_packages.get("all"))
-        if distro_ver.startswith("7"):
-            rpm_all_packages = " ".join(rpm_packages.get("7"))
+        if skip_kernel_workflow:
+            log.info(
+                "Skipping kernel-related prereq steps; "
+                "kernel_update.py handles --custom-config pre=/post="
+            )
+        else:
+            ceph.exec_command(
+                cmd="sudo yum -y upgrade", timeout=600, check_ec=False
+            )
 
-        cmd = f"sudo dnf install --setopt install_weak_deps=False -y {rpm_all_packages}"
+        rpm_pkg_list = rpm_packages.get("7") if distro_ver.startswith("7") else rpm_packages.get("all")
+        if skip_kernel_workflow:
+            rpm_pkg_list = [p for p in rpm_pkg_list if not p.startswith("kernel")]
+        rpm_all_packages = " ".join(rpm_pkg_list)
+
+        # dnf_cmd = (
+        cmd = (
+            f"sudo dnf install --setopt install_weak_deps=False -y {rpm_all_packages}"
+            " --nogpgcheck"
+        )
+        # if skip_kernel_workflow:
+        #     dnf_cmd += " --exclude='kernel*'"
         ceph.exec_command(cmd=cmd, long_running=True)
 
         # Restarting the node for qdisc filter to be loaded. This is required for
@@ -396,6 +421,56 @@ def setup_local_repos(ceph):
     return True
 
 
+def _is_beta_rhel(distro_info):
+    """True for beta/pre-release RHEL."""
+    return "beta" in distro_info.get("PRETTY_NAME", "").lower()
+
+
+BETA_COMPOSE_MIRROR = (
+    "http://download-01.beak-001.prod.iad2.dc.redhat.com/rhel-{major}/nightly/RHEL-{major}"
+)
+
+
+def _enable_beta_compose_repos(ceph, distro_ver):
+    """Add RHEL nightly compose repos on beta/pre-GA nodes.
+
+    CDN *-beta-rpms repos do not yet publish BaseOS/AppStream content needed for
+    prereq packages (lvm2, podman, wget, …), cephadm bootstrap deps, or ceph-common
+    runtime libraries (librdmacm, libpmem, …). The internal nightly compose under
+    latest-RHEL-<version> does.
+    """
+    major = distro_ver.split(".")[0]
+    compose_base = (
+        f"{BETA_COMPOSE_MIRROR.format(major=major)}/latest-RHEL-{distro_ver}/compose"
+    )
+    repo_file = f"/etc/yum.repos.d/rhel-{distro_ver}-nightly-compose.repo"
+    repo_content = f"""[rhel-{major}-nightly-baseos]
+name=RHEL {distro_ver} nightly BaseOS
+baseurl={compose_base}/BaseOS/x86_64/os/
+gpgcheck=0
+enabled=1
+
+[rhel-{major}-nightly-appstream]
+name=RHEL {distro_ver} nightly AppStream
+baseurl={compose_base}/AppStream/x86_64/os/
+gpgcheck=0
+enabled=1
+
+[rhel-{major}-nightly-crb]
+name=RHEL {distro_ver} nightly CRB
+baseurl={compose_base}/CRB/x86_64/os/
+gpgcheck=0
+enabled=1
+"""
+    ceph.exec_command(
+        sudo=True,
+        cmd=f"cat > {repo_file} << 'EOF'\n{repo_content}EOF",
+    )
+    log.info(
+        f"Enabled beta compose repos on {ceph.hostname} (latest-RHEL-{distro_ver})"
+    )
+
+
 def enable_rhel_rpms(ceph, distro_ver):
     """
     Setup cdn repositories for rhel systems
@@ -412,7 +487,37 @@ def enable_rhel_rpms(ceph, distro_ver):
         "10": ["rhel-10-for-x86_64-appstream-rpms", "rhel-10-for-x86_64-baseos-rpms"],
     }
 
-    ceph.exec_command(sudo=True, cmd=f"{sm_cmd} release --set {distro_ver}")
+    if _is_beta_rhel(ceph.distro_info):
+        # Beta/pre-GA RHEL uses CDN beta repos (e.g. rhel-9-for-x86_64-baseos-beta-rpms)
+        # under /content/beta/... and does not expose the image VERSION_ID (e.g. 9.9)
+        # in `subscription-manager release --list`, so `release --set` fails with
+        # "No releases match".
+        log.info(
+            f"Beta RHEL on {ceph.hostname}; skipping subscription-manager "
+            f"release --set {distro_ver}"
+        )
+        repos.update(
+            {
+                "7": [
+                    "rhel-7-server-beta-rpms",
+                    "rhel-7-server-extras-beta-rpms",
+                ],
+                "8": [
+                    "rhel-8-for-x86_64-appstream-beta-rpms",
+                    "rhel-8-for-x86_64-baseos-beta-rpms",
+                ],
+                "9": [
+                    "rhel-9-for-x86_64-appstream-beta-rpms",
+                    "rhel-9-for-x86_64-baseos-beta-rpms",
+                ],
+                "10": [
+                    "rhel-10-for-x86_64-appstream-beta-rpms",
+                    "rhel-10-for-x86_64-baseos-beta-rpms",
+                ],
+            }
+        )
+    else:
+        ceph.exec_command(sudo=True, cmd=f"{sm_cmd} release --set {distro_ver}")
 
     for repo in repos.get(distro_ver.split(".")[0]):
         ceph.exec_command(

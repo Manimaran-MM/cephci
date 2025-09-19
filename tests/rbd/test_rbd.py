@@ -24,6 +24,11 @@ TEST_REPO = "https://github.com/ceph/ceph.git"
 SCRIPT_PATH = "qa/workunits/rbd"
 
 
+def _node_os_major(node) -> str:
+    """Return the OS major version (e.g. 7, 8, 9) from the node."""
+    return node.distro_info["VERSION_ID"].split(".")[0]
+
+
 def get_tag(node) -> str:
     """Get upstream tag that to be picked up for test.
 
@@ -55,7 +60,7 @@ def one_time_setup(node, rhbuild, branch: str) -> None:
     node.exec_command(
         cmd=f"sudo rm -rf ceph && git clone --branch {branch} --single-branch --depth 1 {TEST_REPO}"
     )
-    os_ver = rhbuild.split("-")[-1]
+    os_ver = _node_os_major(node)
     ceph_ver = rhbuild.split("-")[0]
 
     if os_ver == "7":
@@ -123,7 +128,7 @@ def run(ceph_cluster, **kwargs) -> int:
         # By default, tests would be executed on a single client node
         nodes = [ceph_cluster.get_nodes(role="client")[0]]
 
-    os_ver = rhbuild.split("-")[-1]
+    os_ver = _node_os_major(nodes[0])
     if "4." in rhbuild and os_ver == "8":
         nodes[0].exec_command(
             cmd="sudo /usr/sbin/alternatives --set python /usr/bin/python3"
