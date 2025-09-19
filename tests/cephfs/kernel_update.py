@@ -1,9 +1,119 @@
+import datetime
 import time
 import traceback
 
+from tests.cephfs.lib.cephfs_common_lib import CephFSCommonUtils
 from utility.log import Log
 
 log = Log(__name__)
+
+_REBOOT_RECONNECT_TIMEOUT = 300
+_RECONNECT_INTERVAL = 20
+_PER_REBOOT_HEALTH_TIMEOUT = 600
+
+_DIAGNOSTIC_COMMANDS = (
+    "cat /etc/os-release",
+    "uname -r",
+    "ceph versions",
+)
+
+
+def _print_system_info(client, label):
+    """Run OS/kernel/ceph version commands on client.1 and log output."""
+    log.info("=" * 20 + f" {label} " + "=" * 20)
+    log.info(f"Client node: {client.node.hostname}")
+    for cmd in _DIAGNOSTIC_COMMANDS:
+        log.info(f"Executing: {cmd}")
+        out, _ = client.exec_command(sudo=True, cmd=cmd)
+        log.info(f"Output:\n{out}")
+    log.info("=" * 20 + f" End {label} " + "=" * 20)
+
+
+def _node_os_major(node):
+    """Return the OS major version (e.g. 8, 9) for a cluster node."""
+    return node.distro_info["VERSION_ID"].split(".")[0]
+
+
+_PRE_KERNEL_YUM_CMD = (
+    "yum update kernel -y --nogpgcheck "
+    "--disablerepo='*' --enablerepo=rh_add_repo"
+)
+
+
+def _is_mixed_os_cluster(ceph_cluster):
+    """True when client nodes run a different OS major version than other nodes."""
+    client_nodes = ceph_cluster.get_nodes(role="client")
+    all_nodes = ceph_cluster.get_nodes()
+    if not client_nodes or len(client_nodes) == len(all_nodes):
+        return False
+
+    client_majors = {_node_os_major(node) for node in client_nodes}
+    client_hostnames = {node.hostname for node in client_nodes}
+    non_client_majors = {
+        _node_os_major(node)
+        for node in all_nodes
+        if node.hostname not in client_hostnames
+    }
+    if not non_client_majors:
+        return False
+
+    return client_majors != non_client_majors
+
+
+def _kernel_update_nodes(ceph_cluster):
+    """Select nodes for kernel update: clients only on mixed OS, else all nodes."""
+    if _is_mixed_os_cluster(ceph_cluster):
+        nodes = ceph_cluster.get_nodes(role="client")
+        log.info(
+            "Mixed OS cluster detected; kernel update limited to client nodes: "
+            + ", ".join(node.hostname for node in nodes)
+        )
+    else:
+        nodes = ceph_cluster.get_nodes()
+        log.info(
+            "Homogeneous OS cluster; kernel update targets all nodes: "
+            + ", ".join(node.hostname for node in nodes)
+        )
+    return nodes
+
+
+def _reboot_and_reconnect(node, timeout=_REBOOT_RECONNECT_TIMEOUT):
+    """Reboot a node and retry SSH reconnect until timeout."""
+    node.exec_command(sudo=True, cmd="sudo reboot", check_ec=False)
+    end_time = datetime.datetime.now() + datetime.timedelta(seconds=timeout)
+    while datetime.datetime.now() < end_time:
+        time.sleep(_RECONNECT_INTERVAL)
+        try:
+            node.reconnect()
+            log.info("Reconnected to %s after reboot", node.hostname)
+            return
+        except BaseException:
+            log.info(
+                "Waiting for %s to come back after reboot",
+                node.hostname,
+            )
+    raise RuntimeError(f"Failed to reconnect to {node.hostname} after reboot")
+
+
+def _wait_for_cluster_healthy(ceph_cluster, client, node_hostname):
+    """Wait for HEALTH_OK after a node reboot before continuing."""
+    log.info(
+        "Waiting up to %ss for HEALTH_OK after rebooting %s",
+        _PER_REBOOT_HEALTH_TIMEOUT,
+        node_hostname,
+    )
+    cephfs_common_utils = CephFSCommonUtils(ceph_cluster)
+    if cephfs_common_utils.wait_for_healthy_ceph(client, _PER_REBOOT_HEALTH_TIMEOUT):
+        log.error("Cluster did not reach HEALTH_OK after rebooting %s", node_hostname)
+        return 1
+    log.info("Cluster is healthy after rebooting %s", node_hostname)
+    return 0
+
+
+def _reboot_node_and_wait_for_healthy(ceph_cluster, client, node):
+    """Reboot a node, reconnect, and wait for the cluster to recover."""
+    _reboot_and_reconnect(node)
+    return _wait_for_cluster_healthy(ceph_cluster, client, node.hostname)
 
 
 def run(ceph_cluster, **kw):
@@ -23,6 +133,9 @@ def run(ceph_cluster, **kw):
     kernel-modules
     kernel
     """
+    ceph_nodes = None
+    client1 = None
+    diagnostics_started = False
     try:
         clients = ceph_cluster.get_ceph_objects("client")
         test_data = kw.get("test_data")
@@ -51,7 +164,10 @@ def run(ceph_cluster, **kw):
                 f"This test requires minimum 1 client nodes.This has only {len(clients)} clients"
             )
             return 1
-        ceph_nodes = ceph_cluster.get_nodes()
+        client1 = clients[0]
+        ceph_nodes = _kernel_update_nodes(ceph_cluster)
+        _print_system_info(client1, "Before start of TC")
+        diagnostics_started = True
         kernel_package = url.split("/")[-1]
         if "pre" in verification_type:
             log.info(url)
@@ -74,12 +190,11 @@ def run(ceph_cluster, **kw):
                 log.info(f" kernel package {kernel_package}+")
                 if kernel_version not in kernel_package:
                     log.info(f"Updating kernel using private repo {kernel_package}")
-                    cnode.exec_command(
-                        sudo=True, cmd="yum update kernel -y --nogpgcheck"
-                    )
-                    cnode.exec_command(sudo=True, cmd="sudo reboot", check_ec=False)
-                    time.sleep(60)
-                    cnode.reconnect()
+                    cnode.exec_command(sudo=True, cmd=_PRE_KERNEL_YUM_CMD)
+                    if _reboot_node_and_wait_for_healthy(
+                        ceph_cluster, client1, cnode
+                    ):
+                        return 1
                     kernel_version, _ = cnode.exec_command(sudo=True, cmd="uname -r")
                     kernel_version = kernel_version.rstrip()
                     kernel_version = kernel_version.rstrip(".x86_64")
@@ -137,9 +252,8 @@ def run(ceph_cluster, **kw):
                 log.info("Updating kernel using below packages")
                 log.info(kernel_update_cmd)
                 cnode.exec_command(sudo=True, cmd=kernel_update_cmd)
-                cnode.exec_command(sudo=True, cmd="sudo reboot", check_ec=False)
-                time.sleep(60)
-                cnode.reconnect()
+                if _reboot_node_and_wait_for_healthy(ceph_cluster, client1, cnode):
+                    return 1
                 kernel_version, rc = cnode.exec_command(sudo=True, cmd="uname -r")
                 kernel_version = kernel_version.rstrip()
                 kernel_package = kernel_package.rstrip()
@@ -157,3 +271,6 @@ def run(ceph_cluster, **kw):
         log.error(e)
         log.error(traceback.format_exc())
         return 1
+    finally:
+        if diagnostics_started and client1:
+            _print_system_info(client1, "After TC")
