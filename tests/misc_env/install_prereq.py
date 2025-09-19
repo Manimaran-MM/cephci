@@ -57,7 +57,7 @@ rpm_packages = {
         "podman",
         "net-snmp-utils",
         "net-snmp",
-        "kernel-modules-extra",
+        # "kernel-modules-extra",
         "iproute-tc",
         "firewalld",
     ],
@@ -199,14 +199,14 @@ def install_prereq(
         if repo:
             setup_addition_repo(ceph, repo)
 
-        ceph.exec_command(cmd="sudo yum -y upgrade", timeout=600, check_ec=False)
+        # ceph.exec_command(cmd="sudo yum -y upgrade", timeout=600, check_ec=False)
 
         rpm_all_packages = " ".join(rpm_packages.get("all"))
         if distro_ver.startswith("7"):
             rpm_all_packages = " ".join(rpm_packages.get("7"))
 
         ceph.exec_command(
-            cmd=f"sudo yum install -y {rpm_all_packages}", long_running=True
+            cmd=f"sudo yum install -y {rpm_all_packages} --nogpgcheck", long_running=True
         )
 
         # Restarting the node for qdisc filter to be loaded. This is required for
@@ -373,14 +373,14 @@ def enable_rhel_rpms(ceph, distro_ver):
         "10": ["rhel-10-for-x86_64-appstream-rpms", "rhel-10-for-x86_64-baseos-rpms"],
     }
 
-    ceph.exec_command(sudo=True, cmd=f"subscription-manager release --set {distro_ver}")
+    # ceph.exec_command(sudo=True, cmd=f"subscription-manager release --set {distro_ver}")
 
-    for repo in repos.get(distro_ver.split(".")[0]):
-        ceph.exec_command(
-            sudo=True,
-            cmd="subscription-manager repos --enable={r}".format(r=repo),
-            long_running=True,
-        )
+    # for repo in repos.get(distro_ver[0]):
+    #     ceph.exec_command(
+    #         sudo=True,
+    #         cmd="subscription-manager repos --enable={r}".format(r=repo),
+    #         long_running=True,
+    #     )
 
 
 def enable_rhel_eus_rpms(ceph, distro_ver):

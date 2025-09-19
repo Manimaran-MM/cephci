@@ -45,7 +45,7 @@ def run(ceph_cluster, **kw):
                 f"This test requires minimum 1 client nodes.This has only {len(clients)} clients"
             )
             return 1
-        client1 = clients[0]
+        client1 = clients[1]
         log.info("Installing required packages for make")
         client1.exec_command(sudo=True, cmd='dnf groupinstall "Development Tools" -y')
         fs_util_v1.prepare_clients(clients, build)

@@ -249,10 +249,54 @@ class CephAdmin(BootstrapMixin, ShellMixin, RegistryLoginMixin):
                 node.exec_command(cmd="rpm -qa | grep ceph")
 
         else:
+            # nodes = self.cluster.get_nodes()
             for node in nodes:
                 if self.config["product"] == "ibm":
                     setup_ibm_licence(node, build_type=None)
 
+#                 cmd1= """cat >/etc/yum.repos.d/rhel-9.7-ga-baseos.repo <<'EOF'
+# [rhel-9.7-ga-baseos]
+# name=RHEL 9.7 GA BaseOS (overlay)
+# baseurl=http://download.eng.pnq.redhat.com/rhel-9/rel-eng/updates/RHEL-9/RHEL-9.7.0-updates-20251125.2/compose/BaseOS/x86_64/os/
+# enabled=1
+# gpgcheck=0
+# priority=1
+# EOF"""
+#                 cmd1= """cat >/etc/yum.repos.d/rhel-9.7-ga-baseos.repo <<'EOF'
+# [rhel-9.7-ga-baseos]
+# name=RHEL 10.1 GA BaseOS (overlay)
+# baseurl=https://download.eng.pnq.redhat.com/rhel-10/rel-eng/updates/RHEL-10/RHEL-10.1-updates-20251210.0/compose/BaseOS/x86_64/os/
+# enabled=1
+# gpgcheck=0
+# priority=1
+# EOF"""
+
+#                 node.exec_command(
+#                     sudo=True,
+#                     cmd=cmd1,
+#                     long_running=True,
+#                     check_ec=False,
+#                 )
+
+#                 cmd2="dnf install -y lvm2 --disablerepo=\"*\" --enablerepo=\"rhel-9.7-ga-baseos\""
+#                 node.exec_command(
+#                     sudo=True,
+#                     cmd=cmd2,
+#                     long_running=True,
+#                     check_ec=False,
+#                 )
+
+#                 cmd3 = "yum install -y wget git-core python3-devel chrony yum-utils net-tools lvm2 podman net-snmp-utils net-snmp iproute-tc firewalld --nogpgcheck"
+#                 node.exec_command(
+#                     sudo=True,
+#                     cmd=cmd3,
+#                     long_running=True,
+#                     check_ec=False,
+#                 )   
+
+#             nodes = self.cluster.get_nodes(ignore="client")
+#             for node in nodes:
+#                 cmd += " --disablerepo=\"*\" --enablerepo=\"ceph-Tools\""
                 node.exec_command(
                     sudo=True,
                     cmd=cmd,
