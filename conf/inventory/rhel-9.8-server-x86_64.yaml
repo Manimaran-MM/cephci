@@ -1,13 +1,14 @@
 ---
-version_id: 9.0
+version_id: 9.8
 id: rhel
 instance:
   create:
-    image-name: RHEL-9.0.0-x86_64-nightly-updates-latest
+    image-name: RHEL-9.8.0-x86_64-nightly-latest
     vm-size: ci.standard.medium
 
   setup: |
     #cloud-config
+
     ssh_pwauth: true
     disable_root: false
 

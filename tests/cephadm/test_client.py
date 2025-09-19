@@ -172,7 +172,7 @@ def add(cls, config: Dict) -> None:
                     _node, "/etc/ceph/ceph.client.admin.keyring", admin_keyring, "w"
                 )
 
-            # Install ceph-common
+            # Install ceph-common (beta RHEL compose repos are enabled in install_prereq)
             if config.get("install_packages"):
                 for pkg in config.get("install_packages"):
                     if _rpm_version:

@@ -1015,6 +1015,22 @@ def parse_custom_config_list(custom_config):
     return dict(item.split("=", 1) for item in custom_config if "=" in item)
 
 
+def is_kernel_update_custom_config(test_data):
+    """
+    Return True when cephci was run with kernel pipeline custom config.
+
+    Matches ``--custom-config pre=<url>`` or ``--custom-config post=<url>`` as
+    used by tests/cephfs/kernel_update.py.
+    """
+    if not test_data:
+        return False
+    custom_config = test_data.get("custom-config")
+    if not custom_config:
+        return False
+    overrides = parse_custom_config_list(custom_config)
+    return "pre" in overrides or "post" in overrides
+
+
 def resolve_use_ipv6(custom_config, cloud_type=None, osp_cred=None):
     """
     Resolve whether to use IPv6 from custom_config and optionally from infra credentials.
