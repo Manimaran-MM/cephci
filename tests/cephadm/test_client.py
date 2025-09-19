@@ -190,7 +190,7 @@ def add(cls, config: Dict) -> None:
                     _node, "/etc/ceph/ceph.client.admin.keyring", admin_keyring, "w"
                 )
 
-            # Install ceph-common
+            # Install ceph-common (beta RHEL compose repos are enabled in install_prereq)
             if config.get("install_packages"):
                 _manifest = manifest_obj or cls.config.get("manifest")
                 if _manifest and _manifest.product == "ibm":
