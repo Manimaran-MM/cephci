@@ -122,6 +122,12 @@ class CephAdmin(BootstrapMixin, ShellMixin, RegistryLoginMixin):
                 node.exec_command(sudo=True, cmd="yum update metadata", check_ec=False)
         elif repo:
             base_url = repo
+            if not base_url.endswith("/"):
+                base_url += "/"
+            if cloud_type == "ibmc" and not base_url.endswith("repo"):
+                base_url += "Tools"
+            else:
+                base_url += "compose/Tools/x86_64/os/"
             cmd = f"yum-config-manager --add-repo {base_url}"
             for node in self.cluster.get_nodes():
                 node.exec_command(sudo=True, cmd=cmd)
