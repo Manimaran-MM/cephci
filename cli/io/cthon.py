@@ -43,6 +43,7 @@ class Cthon(Cli):
             if not self._is_subscription_registered():
                 log.info("Skipping adding cthon repos since system is not subscribed")
             else:
+                log.info("Adding cthon repos since system is subscribed")
                 SubscriptionManager(self.client).repos.enable(
                     "codeready-builder-for-rhel-$(rpm -E %rhel)-$(arch)-rpms"
                 )
@@ -56,6 +57,7 @@ class Cthon(Cli):
             if not self._is_subscription_registered():
                 log.info("Skipping removing cthon repos since system is not subscribed")
             else:
+                log.info("Removing cthon repos since system is subscribed")
                 SubscriptionManager(self.client).repos.disable(
                     "codeready-builder-for-rhel-$(rpm -E %rhel)-$(arch)-rpms"
                 )
@@ -116,17 +118,12 @@ class Cthon(Cli):
                 "subscription-manager status | grep 'Overall Status' | awk '{print $3}'"
             )
             out, _ = self.client.exec_command(sudo=True, cmd=cmd)
-            status = out.strip()
-            log.info("Subscription status output: {}".format(status))
-            # In RHEL-9, "Disabled" means registered
-            # In RHEL-10, "Registered" means registered
-            is_subscribed = status.lower() in ["registered", "disabled"]
-            log.info(
-                "System is {}".format(
-                    "subscribed" if is_subscribed else "not subscribed"
-                )
-            )
-            return is_subscribed
+            log.info(f"Subscription status output: {out.strip()}")
+            if out.strip() != "Registered":
+                log.info("System is not subscribed")
+                return False
+            log.info("System is subscribed")
+            return True
         except Exception as e:
             raise CommandFailed(
                 "Failed to identify subscription status \n error: {0}".format(e)
