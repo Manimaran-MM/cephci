@@ -116,6 +116,7 @@ def run(ceph_cluster, get_fs_info=None, **kw):
 
         if not fs_details:
             fs_util.create_fs(client1, fs_name)
+            fs_util.wait_for_mds_process(client1, process_name=fs_name)
 
         mount_dir = "".join(
             secrets.choice(string.ascii_uppercase + string.digits) for i in range(5)
