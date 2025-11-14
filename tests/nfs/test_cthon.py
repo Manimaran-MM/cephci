@@ -9,18 +9,25 @@ from nfs_operations import (
 
 from cli.exceptions import ConfigError, OperationFailedError
 from cli.io.cthon import Cthon
+from tests.cephfs.lib.cephfs_common_lib import CephFSCommonUtils
 from utility.log import Log
 from utility.retry import retry
 
 log = Log(__name__)
 
 
-@retry(OperationFailedError, tries=4, delay=10, backoff=2)
+@retry(OperationFailedError, tries=5, delay=15, backoff=2)
 def run_single_export(client, export, mount, nfs_node_ip, cthon_obj):
     """
     Run Cthon on a single export/mount for a client.
     Retries on failure.
     """
+    log.info("Warming up the mount before running Cthon tests...")
+    client.exec_command(sudo=True, cmd=f"ls -lR {mount}")
+    client.exec_command(sudo=True, cmd=f"dd if=/dev/zero of={mount}/warmfile bs=4k count=1")
+    client.exec_command(sudo=True, cmd=f"rm -f {mount}/warmfile")
+    time.sleep(2)
+    out, err = None, None
     try:
         out, err = cthon_obj.execute_cthon(
             export_psudo_path=export,
@@ -33,8 +40,45 @@ def run_single_export(client, export, mount, nfs_node_ip, cthon_obj):
             )
     except Exception as e:
         log.error(
-            f"Cthon test failed for export: {export} on client: {client.hostname} - Error: {e}"
+            f"Cthon test failed for export: {export} on client: {client.hostname} - \n Error: {e}"
         )
+        log.error("Sleeping for 3 hours to debug")
+        time.sleep(10800)
+        log.info("Validating if the mount is still accessible...")
+        try:
+            cmd = f'bash -c "time for i in {{1..1000}}; do touch {mount}/test_$i; rm {mount}/test_$i; done"'
+            out, _ = client.exec_command(sudo=True, cmd=cmd)
+            log.info(f"Mount {mount} is accessible. Command output: {out}")
+            cmd = f"ls -ld {mount}"
+            out, _ = client.exec_command(cmd=cmd, sudo=True)
+            log.info(f"Mount {mount} is still accessible. ls output: {out}")
+            out, _ = client.exec_command(sudo=True, cmd=f"df -h {mount}", check_ec=False)
+            log.info(f"Mount {mount} df output: {out}")
+            out, _ = client.exec_command(sudo=True, cmd=f"mount | grep {mount}", check_ec=False)
+            log.info(f"Mount {mount} mount output: {out}")
+            out, _ = client.exec_command(sudo=True, cmd=f"showmount -e {nfs_node_ip}", check_ec=False)
+            log.info(f"Mount {mount} showmount output: {out}")
+            out, _ = client.exec_command(sudo=True, cmd="dmesg | tail -n 100", check_ec=False)
+            log.info(f"Mount {mount} dmesg output: {out}")
+            out, _ = client.exec_command(sudo=True, cmd=f"touch {mount}/test_file")
+            log.info(f"Mount {mount} is writable. touch output: {out}")
+            out, _ = client.exec_command(sudo=True, cmd=f"echo 'cthon test' > {mount}/test_file")
+            log.info(f"Mount {mount} is writable. echo output: {out}")
+
+            out, _ = client.exec_command(sudo=True, cmd=f"ls -la {mount}")
+            log.info(f"Mount {mount} ls -la output: {out}")
+            out, _ = client.exec_command(sudo=True, cmd=f"nfsstat -m", check_ec=False)
+            log.info(f"Mount {mount} nfsstat output: {out}")
+            out, _ = client.exec_command(sudo=True, cmd=f"nfsstat -rc", check_ec=False)
+            log.info(f"Mount {mount} nfsstat -rc output: {out}")
+            out, _ = client.exec_command(sudo=True, cmd=f"nfsstat -s", check_ec=False)
+            log.info(f"Mount {mount} nfsstat -s output: {out}")
+            out, _ = client.exec_command(sudo=True, cmd=f"nfsstat -c", check_ec=False)
+            log.info(f"Mount {mount} nfsstat -c output: {out}")
+            out, _ = client.exec_command(sudo=True, cmd=f"ping -c 100 {nfs_node_ip}", check_ec=False)
+            log.info(f"Mount {mount} ping output: {out}")
+        except Exception as le:
+            log.error(f"Mount {mount} is not accessible. Error: {le}")
         raise OperationFailedError(f"Cthon test failed on {client.hostname}")
 
 
@@ -64,6 +108,7 @@ def run(ceph_cluster, **kw):
     - Cleans up all resources at the end.
     """
     config = kw.get("config")
+    cephfs_common_utils = CephFSCommonUtils(ceph_cluster)
     nfs_nodes = ceph_cluster.get_nodes("nfs")
     clients = ceph_cluster.get_nodes(role="client")
 
@@ -116,6 +161,9 @@ def run(ceph_cluster, **kw):
                 f.result()
         log.info("Dependencies installed.")
 
+        log.info("Verifying cluster health before running Cthon tests...")
+        cephfs_common_utils.wait_for_healthy_ceph(clients[0], 60)
+                
         def execute_all_clients():
             """
             Run Cthon tests on all clients in parallel.

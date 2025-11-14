@@ -1,5 +1,6 @@
 import secrets
 import string
+import time
 import traceback
 from datetime import datetime, timedelta
 from time import sleep
@@ -65,11 +66,11 @@ def mds_rm_add(fs_util, mdss, client, fs_name="cephfs"):
         initial_mds_count = str(len(mds_hosts))
         initial_mds_count.rstrip()
         count = str(int(initial_mds_count) - 1)
-        cmd = f"ceph orch  --verbose apply mds {fs_name} --placement='{mdss_hosts}'"
+        cmd = f"ceph orch apply mds {fs_name} --placement='{mdss_hosts}'"
         client.exec_command(sudo=True, cmd=cmd)
         wait_for_cmd(client, f"mds.{fs_name}", count)
         mdss_hosts = " ".join([str(elem) for elem in mds_hosts])
-        cmd = f"ceph orch  --verbose apply mds {fs_name} --placement='{mdss_hosts}'"
+        cmd = f"ceph orch apply mds {fs_name} --placement='{mdss_hosts}'"
         client.exec_command(sudo=True, cmd=cmd)
         wait_for_cmd(client, f"mds.{fs_name}", initial_mds_count)
         stop_flag = True
@@ -116,6 +117,7 @@ def run(ceph_cluster, get_fs_info=None, **kw):
 
         if not fs_details:
             fs_util.create_fs(client1, fs_name)
+            fs_util.wait_for_mds_process(client1, fs_name)
 
         mount_dir = "".join(
             secrets.choice(string.ascii_uppercase + string.digits) for i in range(5)
@@ -144,18 +146,22 @@ def run(ceph_cluster, get_fs_info=None, **kw):
                 fs_util,
                 client1,
                 kernel_mount_dir + "/kernel_1",
+                timeout=0,
             )
             p.spawn(
                 start_io_time,
                 fs_util,
                 client1,
                 fuse_mount_dir + "/fuse_1",
+                timeout=0,
             )
         return 0
 
     except Exception as e:
         log.error(e)
         log.error(traceback.format_exc())
+        log.info("Sleeping for 3 hours to debug")
+        time.sleep(10800)
         return 1
     finally:
         try:

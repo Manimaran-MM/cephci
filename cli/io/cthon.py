@@ -97,6 +97,7 @@ class Cthon(Cli):
             export_psudo_path, mount_dir, server_node_ip, self.dir, pwd
         )
         out, err = self.client.exec_command(cmd=cmd, timeout=600, sudo=True)
+        log.info("Inside execute_cthon command output: {0} /n Error: {1}".format(out, err))
         return out, err
 
     def cleanup(self):
