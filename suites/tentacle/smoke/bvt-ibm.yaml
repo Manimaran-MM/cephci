@@ -194,3 +194,10 @@ tests:
         nfs_version: 4.2
         clients: 1
         operation: mv_file_overwrite
+
+  - test:
+      name: Scrub Investigate
+      module: test_scrub_investigate.py
+      desc: Deploy cluster to test scrubbing
+      config:
+        sleep-duration: 7200
