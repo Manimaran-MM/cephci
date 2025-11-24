@@ -630,7 +630,12 @@ def setup_repos(
     cloud_type="openstack",
     ibm_build=False,
 ):
+    log.info(f"cloud type is {cloud_type}")
     if base_url.endswith(".repo"):
+        if not base_url.endswith(".repo") and not base_url.endswith("Tools"):
+            if not base_url.endswith("/"):
+                base_url += "/"
+            base_url += "Tools"
         cmd = f"yum-config-manager --add-repo {base_url}"
         ceph.exec_command(sudo=True, cmd=cmd)
 

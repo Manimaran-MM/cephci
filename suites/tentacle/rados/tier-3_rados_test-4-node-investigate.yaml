@@ -1,4 +1,5 @@
-# Suite is to be used to verify the scrub tests  on 4 nodes
+# Suite is to be used to verify the EC 2+2 config on 4 nodes
+# to be run in regression conf: 4-node-ec-cluster-1-client.yaml
 tests:
   - test:
       name: setup install pre-requisistes
@@ -21,6 +22,7 @@ tests:
                 verbose: true
               args:
                 mon-ip: node1
+
   - test:
       name: Add host
       desc: Add new host node with IP address
@@ -34,6 +36,7 @@ tests:
             - node2
             - node3
             - node4
+            - node5
           attach_ip_address: true
           labels: apply-all-labels
       destroy-cluster: false
@@ -156,121 +159,42 @@ tests:
       desc: Change config options to enable logging to file
 
   - test:
-      name: Set configs for 4 node cluster
-      desc: Set configs for 4 node cluster
-      module: test_cephadm.py
+      name: Inconsistent objects in  EC pool functionality check
+      desc: Scub and deep-scrub on  inconsistent objects in EC pool
+      module: test_osd_ecpool_inconsistency_scenario.py
+      polarion-id: CEPH-83586175
       config:
-        steps:
-          - config:
-              command: shell
-              args:
-                - ceph
-                - config
-                - set
-                - mon
-                - mon_osd_down_out_subtree_limit
-                - host
+        ec_pool:
+          create: true
+          pool_name: ecpool
+          pg_num: 1
+          k: 2
+          m: 2
+          plugin: jerasure
+          crush-failure-domain: host
+          disable_pg_autoscale: true
+        inconsistent_obj_count: 4
+        debug_enable: False
+        delete_pool:
+          - ecpool
+      comments: Intermittent active bug 2277111, 2299659
 
-#  - test:
-#      name: Inconsistent objects in  EC pool functionality check
-#      desc: Scub and deep-scrub on  inconsistent objects in EC pool
-#      module: test_osd_ecpool_inconsistency_scenario.py
-#      polarion-id: CEPH-83586175
-#      config:
-#        ec_pool:
-#          create: true
-#          pool_name: ecpool
-#          pg_num: 1
-#          k: 2
-#          m: 2
-#          plugin: jerasure
-#          crush-failure-domain: host
-#          disable_pg_autoscale: true
-#        inconsistent_obj_count: 4
-#        debug_enable: False
-#        delete_pool:
-#          - ecpool
-#      comments: Intermittent active bug 2277111, 2299659
-#
-#  - test:
-#      name: Case 1-Inconsistent objects  verification
-#      desc: Scrub:Inconsistent objects>auto repair errors count & auto_repair is true
-#      module: test_osd_replicated_inconsistency_scenario.py
-#      polarion-id: CEPH-83586175
-#      config:
-#        pool_name: replicated_pool
-#        pg_num_max: 1
-#        inconsistent_obj_count: 4
-#        debug_enable: False
-#        case_to_run:
-#          - case1
-#
-#  - test:
-#      name: Case 2-Inconsistent objects  verification
-#      desc: Scrub:Inconsistent objects<auto repair errors count & auto_repair is false
-#      module: test_osd_replicated_inconsistency_scenario.py
-#      polarion-id: CEPH-83586175
-#      config:
-#        pool_name: replicated_pool
-#        pg_num_max: 1
-#        inconsistent_obj_count: 4
-#        debug_enable: False
-#        case_to_run:
-#          - case2
-#  - test:
-#      name: Case 3-Inconsistent objects verification
-#      desc: Scrub:Inconsistent objects<auto repair errors count & auto_repair is true
-#      module: test_osd_replicated_inconsistency_scenario.py
-#      polarion-id: CEPH-83586175
-#      config:
-#        pool_name: replicated_pool
-#        pg_num_max: 1
-#        inconsistent_obj_count: 4
-#        debug_enable: False
-#        case_to_run:
-#          - case3
-#  - test:
-#      name: Case 4-Inconsistent objects verification
-#      desc: Deep-Scrub:Inconsistent objects>auto repair errors count & auto_repair is true
-#      module: test_osd_replicated_inconsistency_scenario.py
-#      polarion-id: CEPH-83586175
-#      config:
-#        pool_name: replicated_pool
-#        pg_num_max: 1
-#        inconsistent_obj_count: 4
-#        debug_enable: False
-#        case_to_run:
-#          - case4
-#  - test:
-#      name: Case 5-Inconsistent objects verification
-#      desc: Deep-Scrub:Inconsistent objects<auto repair errors count & auto_repair is false
-#      module: test_osd_replicated_inconsistency_scenario.py
-#      polarion-id: CEPH-83586175
-#      config:
-#        pool_name: replicated_pool
-#        pg_num_max: 1
-#        inconsistent_obj_count: 4
-#        debug_enable: False
-#        case_to_run:
-#          - case5
-#  - test:
-#      name: Case 6-Inconsistent objects verification
-#      desc: Deep-Scrub:Inconsistent objects<auto repair errors count & auto_repair is true
-#      module: test_osd_replicated_inconsistency_scenario.py
-#      polarion-id: CEPH-83586175
-#      config:
-#        pool_name: replicated_pool
-#        pg_num_max: 1
-#        inconsistent_obj_count: 4
-#        debug_enable: False
-#        case_to_run:
-#          - case6
   - test:
-      name: Validation of pool-level noscrub and nodeep-scrub settings.
-      desc: Verification of pool scrub settings and ensures user-initiated scrubs still run.
-      module: test_scrub_flag_pool_level.py
-      polarion-id: CEPH-83621444
+      name: Case 1-Inconsistent objects  verification
+      desc: Scrub:Inconsistent objects>auto repair errors count & auto_repair is true
+      module: test_osd_replicated_inconsistency_scenario.py
+      polarion-id: CEPH-83586175
       config:
-        pool_names:
-          - active_pool
-          - inactive_pool
+        pool_name: replicated_pool
+        pg_num_max: 1
+        inconsistent_obj_count: 4
+        debug_enable: False
+        case_to_run:
+          - case1
+
+  - test:
+      name: Scrub Investigate
+      module: test_scrub_investigate.py
+      desc: Deploy cluster to test scrubbing
+      config:
+        sleep-duration: 7200

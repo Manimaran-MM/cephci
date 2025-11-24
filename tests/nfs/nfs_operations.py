@@ -290,7 +290,8 @@ def setup_custom_nfs_cluster_multi_export_client(
                 nfs_name=nfs_name,
                 nfs_export=export_name,
                 fs=fs,
-                enctag=kwargs.get("enctag") if kwargs.get("enctag") else None,
+                # enctag=kwargs.get("enctag") if kwargs.get("enctag") else None,
+                **({"enctag": kwargs["enctag"]} if "enctag" in kwargs else {}),
             )
             all_exports = Ceph(clients[0]).nfs.export.ls(nfs_name)
             if export_name not in all_exports:

@@ -9,6 +9,7 @@ from nfs_operations import (
 
 from cli.exceptions import ConfigError, OperationFailedError
 from cli.io.cthon import Cthon
+from tests.cephfs.lib.cephfs_common_lib import CephFSCommonUtils
 from utility.log import Log
 from utility.retry import retry
 
@@ -64,6 +65,7 @@ def run(ceph_cluster, **kw):
     - Cleans up all resources at the end.
     """
     config = kw.get("config")
+    cephfs_common_utils = CephFSCommonUtils(ceph_cluster)
     nfs_nodes = ceph_cluster.get_nodes("nfs")
     clients = ceph_cluster.get_nodes(role="client")
 
@@ -115,6 +117,9 @@ def run(ceph_cluster, **kw):
             for f in futures:
                 f.result()
         log.info("Dependencies installed.")
+
+        log.info("Verifying cluster health before running Cthon tests...")
+        cephfs_common_utils.wait_for_healthy_ceph(clients[0], 60)
 
         def execute_all_clients():
             """

@@ -180,9 +180,14 @@ def add(cls, config: Dict) -> None:
             # Install ceph-common
             if config.get("install_packages"):
                 for pkg in config.get("install_packages"):
-                    _node.exec_command(
-                        cmd=f"yum install -y --nogpgcheck {pkg}", sudo=True
-                    )
+                    if "ceph-common" in pkg:
+                        _node.exec_command(sudo=True, cmd="yum clean all")
+                        _node.exec_command(sudo=True, cmd="yumdownloader --resolve --destdir=/tmp/ceph ceph-common")
+                        _node.exec_command(sudo=True, cmd="rpm -Uvh /tmp/ceph/*.rpm --nodeps")
+                    else:
+                        _node.exec_command(
+                            cmd=f"yum install -y --nogpgcheck {pkg}", sudo=True
+                        )
             if config.get("git_clone", False):
                 log.info("perform cloning operation")
                 role = config.get("git_node_role", "client")
