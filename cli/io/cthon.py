@@ -69,7 +69,8 @@ class Cthon(Cli):
             # Install cthon packages
             git_clone(
                 node=self.client,
-                git_link="git://git.linux-nfs.org/projects/steved/cthon04.git",
+                # git_link="git://git.linux-nfs.org/projects/steved/cthon04.git",
+                git_link="https://github.com/phdeniel/cthon04.git",
                 dir=self.dir,
             )
 
