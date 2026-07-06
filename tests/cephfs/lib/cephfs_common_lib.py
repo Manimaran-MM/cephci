@@ -52,6 +52,11 @@ class CephFSCommonUtils(FsUtils):
             "Slow OSD heartbeats",
             "stray daemon(s) not managed by cephadm",
             "CALL_HOME_ENABLED_AUTOMATICALLY",
+            "auth client entities with insecure key types",
+            "using insecure key type: aes",
+            "Monitors are configured to allow auth using insecure key types",
+            "Monitors are configured to allow creation of insecure key types",
+            "insecure cipher aes allowed for auth",
         ]
         non_accepted_list = ["OSD_DOWN", "OSD_HOST_DOWN"]
         while ceph_healthy == 0 and (datetime.datetime.now() < end_time):
