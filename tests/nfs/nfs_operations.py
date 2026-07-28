@@ -1163,6 +1163,8 @@ def create_nfs_via_file_and_verify(
 
     try:
         pos_args = []
+        out, _ = installer_node.exec_command(sudo=True, cmd=f"cat {remote_spec}")
+        log.info("NFS orch spec %s:\n%s", remote_spec, (out or "").strip())
         CephAdm(installer_node, mount="/tmp/").ceph.orch.apply(
             input=remote_spec, check_ec=True, pos_args=pos_args
         )
