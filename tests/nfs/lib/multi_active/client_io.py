@@ -367,7 +367,7 @@ class NfsMultiActiveClientIO:
             try:
                 client.exec_command(
                     sudo=True,
-                    cmd=f"mkdir -p {io_dir} && chown cephuser:cephuser {io_dir}",
+                    cmd=f"mkdir -p {io_dir} && chown cephuser {io_dir}",
                 )
                 NfsMultiActiveClientIO._assert_io_dir_on_nfs(client, io_dir)
                 dd_cmd = (
@@ -598,7 +598,7 @@ class NfsMultiActiveClientIO:
                 NfsMultiActiveClientIO.ensure_fio(client)
                 client.exec_command(
                     sudo=True,
-                    cmd=f"mkdir -p {io_dir} && chown cephuser:cephuser {io_dir}",
+                    cmd=f"mkdir -p {io_dir} && chown cephuser {io_dir}",
                 )
                 NfsMultiActiveClientIO._assert_io_dir_on_nfs(client, io_dir)
                 fio_cmd = (
