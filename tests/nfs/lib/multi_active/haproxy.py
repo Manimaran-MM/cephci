@@ -13,6 +13,7 @@ log = Log(__name__)
 
 STICK_TABLE_TIMEOUT = 120
 STICK_TABLE_INTERVAL = 5
+_SOCAT_ENSURED_HOSTS = set()
 
 
 class NfsMultiActiveHaproxy:
@@ -28,6 +29,23 @@ class NfsMultiActiveHaproxy:
                 clients[0] if clients else ceph_cluster.get_nodes("installer")[0]
             )
         self.validator = NfsMultiActiveValidation(ceph_cluster, info_client)
+        # One-time pre-req: stick-table queries use socat on HAProxy hosts.
+        self.ensure_socat(ceph_cluster.node_list)
+
+    @staticmethod
+    def ensure_socat(nodes):
+        """Install socat on each node once when missing (suite-wide pre-req)."""
+        for node in nodes:
+            hostname = getattr(node, "hostname", None) or str(node)
+            if hostname in _SOCAT_ENSURED_HOSTS:
+                continue
+            log.info("Ensuring socat is installed on %s", hostname)
+            node.exec_command(
+                sudo=True,
+                cmd="rpm -q socat || yum install -y socat",
+                check_ec=False,
+            )
+            _SOCAT_ENSURED_HOSTS.add(hostname)
 
     def validate_entries(
         self,

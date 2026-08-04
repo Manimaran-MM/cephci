@@ -37,7 +37,7 @@ class NfsMultiActiveClient(NfsMultiActiveClientIO):
         )
         client.create_dirs(dir_path=nfs_mount, sudo=True)
         mount_retry(client, nfs_mount, version, port, mount_server, export_name)
-        client.exec_command(sudo=True, cmd=f"chown cephuser:cephuser {nfs_mount}")
+        client.exec_command(sudo=True, cmd=f"chown cephuser {nfs_mount}")
         sleep(2)
 
     @staticmethod
@@ -104,7 +104,7 @@ class NfsMultiActiveClient(NfsMultiActiveClientIO):
         )
 
         writer_client.exec_command(sudo=True, cmd=f"mkdir -p {io_dir}")
-        writer_client.exec_command(sudo=True, cmd=f"chown cephuser:cephuser {io_dir}")
+        writer_client.exec_command(sudo=True, cmd=f"chown cephuser {io_dir}")
         NfsMultiActiveClient._assert_io_dir_on_nfs(writer_client, io_dir)
         NfsMultiActiveClient._assert_io_dir_on_nfs(reader_client, io_dir)
 
