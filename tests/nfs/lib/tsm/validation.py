@@ -4,11 +4,19 @@ import json
 
 from ceph.waiter import WaitUntil
 from cli.ceph.ceph import Ceph
-from cli.exceptions import OperationFailedError
 from tests.nfs.lib.common_lib import (
     assert_port_listening,
+    get_nfs_container_id,
     read_ganesha_conf,
     scrape_nfs_logs,
+)
+from tests.nfs.lib.tsm.constants import (
+    TSM_DISABLE_ABSENT,
+    TSM_DISABLE_PEER_PRESENT,
+    TSM_DISABLE_PRESENT,
+    TSM_FIRST_BOOT_PRESENT,
+    TSM_PRIMARY_SELECTION_FAIL_ABSENT,
+    TSM_PRIMARY_SELECTION_FAIL_PRESENT,
 )
 from utility.log import Log
 
@@ -38,11 +46,13 @@ class NfsTsmValidation:
         self.poll_interval = poll_interval
 
     def get_cluster_info(self, nfs_name):
+        """Return cluster info dict, or None on failure."""
         info = Ceph(self.client).nfs.cluster.info(nfs_name)
         if not info or nfs_name not in info:
-            raise OperationFailedError(
-                f"Cluster {nfs_name!r} not found in nfs cluster info: {info!r}"
+            log.error(
+                "Cluster %r not found in nfs cluster info: %r", nfs_name, info
             )
+            return None
         log.info("NFS cluster info for %s:\n%s", nfs_name, json.dumps(info, indent=2))
         return info[nfs_name]
 
@@ -53,21 +63,33 @@ class NfsTsmValidation:
         expect_enabled=True,
         expected_tsm_port=None,
     ):
-        """Verify enable_TSM and Tsm_Port in ganesha.conf on each NFS node."""
+        """Verify enable_TSM / Tsm_Port in ganesha.conf on each NFS node.
+
+        ``expect_enabled``:
+          True  — keys present with enable_TSM=true and matching Tsm_Port
+          False — keys present with enable_TSM=false and matching Tsm_Port
+          None  — both TSM keys must be absent from NFS_CORE_PARAM
+
+        Returns list of per-node results on success, or None on failure.
+        """
         log.info("GANESHA.CONF TSM VALIDATION")
         conf_by_host = read_ganesha_conf(nfs_nodes, nfs_name=nfs_name)
+        if conf_by_host is None:
+            return None
         expected_port = str(
             self.tsm_port if expected_tsm_port is None else expected_tsm_port
         )
-        expected_enabled = "true" if expect_enabled else "false"
         results = []
 
         for node in nfs_nodes:
             conf = conf_by_host.get(node.hostname)
             if not conf:
-                raise OperationFailedError(f"No ganesha.conf for {node.hostname}")
+                log.error("No ganesha.conf for %s", node.hostname)
+                return None
 
             core = conf.get("NFS_CORE_PARAM", {})
+            has_enabled = self.enable_tsm_key in core
+            has_port = self.tsm_port_key in core
             enabled = str(core.get(self.enable_tsm_key, "")).lower()
             tsm_port = str(core.get(self.tsm_port_key, ""))
             peers = [
@@ -81,22 +103,45 @@ class NfsTsmValidation:
                 "%s: %s=%s %s=%s peers=%s",
                 node.hostname,
                 self.enable_tsm_key,
-                enabled,
+                enabled if has_enabled else "<absent>",
                 self.tsm_port_key,
-                tsm_port,
+                tsm_port if has_port else "<absent>",
                 peers,
             )
 
-            if enabled != expected_enabled:
-                raise OperationFailedError(
-                    f"{node.hostname}: expected {self.enable_tsm_key}={expected_enabled}, "
-                    f"got {enabled!r}"
-                )
-            if tsm_port != expected_port:
-                raise OperationFailedError(
-                    f"{node.hostname}: expected {self.tsm_port_key}={expected_port}, "
-                    f"got {tsm_port!r}"
-                )
+            if expect_enabled is None:
+                if has_enabled or has_port:
+                    log.error(
+                        "%s: expected %s/%s absent, got %s=%r %s=%r",
+                        node.hostname,
+                        self.enable_tsm_key,
+                        self.tsm_port_key,
+                        self.enable_tsm_key,
+                        enabled,
+                        self.tsm_port_key,
+                        tsm_port,
+                    )
+                    return None
+            else:
+                expected_enabled = "true" if expect_enabled else "false"
+                if enabled != expected_enabled:
+                    log.error(
+                        "%s: expected %s=%s, got %r",
+                        node.hostname,
+                        self.enable_tsm_key,
+                        expected_enabled,
+                        enabled,
+                    )
+                    return None
+                if tsm_port != expected_port:
+                    log.error(
+                        "%s: expected %s=%s, got %r",
+                        node.hostname,
+                        self.tsm_port_key,
+                        expected_port,
+                        tsm_port,
+                    )
+                    return None
 
             results.append(
                 {
@@ -113,7 +158,10 @@ class NfsTsmValidation:
     def assert_tsm_peer_connections(
         self, nodes, tsm_port=None, timeout=None, min_peers=1
     ):
-        """Wait until each node has ESTAB TCP sessions to peer IPs on TSM port."""
+        """Wait until each node has ESTAB TCP sessions to peer IPs on TSM port.
+
+        Returns 0 on success, 1 on failure.
+        """
         port = int(tsm_port if tsm_port is not None else self.tsm_port)
         timeout = self.timeout if timeout is None else timeout
         ips = {node.hostname: node.ip_address for node in nodes}
@@ -121,9 +169,10 @@ class NfsTsmValidation:
         for node in nodes:
             peers = [ip for host, ip in ips.items() if host != node.hostname and ip]
             if len(peers) < min_peers:
-                raise OperationFailedError(
-                    f"{node.hostname}: need >= {min_peers} peers, got {peers}"
+                log.error(
+                    "%s: need >= %s peers, got %s", node.hostname, min_peers, peers
                 )
+                return 1
 
             for _ in WaitUntil(timeout=timeout, interval=self.poll_interval):
                 out, _ = node.exec_command(
@@ -138,10 +187,171 @@ class NfsTsmValidation:
                     log.info("%s: TSM ESTAB peers ok -> %s", node.hostname, peers)
                     break
             else:
-                raise OperationFailedError(
-                    f"{node.hostname}: timed out waiting for TSM ESTAB to {peers} "
-                    f"on port {port}"
+                log.error(
+                    "%s: timed out waiting for TSM ESTAB to %s on port %s",
+                    node.hostname,
+                    peers,
+                    port,
                 )
+                return 1
+        return 0
+
+    def _assert_boot_path(self, node, nfs_name, present, absent, since, label):
+        """Require present markers and forbid absent markers. Returns 0 or 1.
+
+        ``present`` as a tuple/list of plain strings: each must match (INFO-level
+        first-boot). A single OR-regex string: any match is enough (recovery).
+        ``absent`` is typically one OR-regex; any hit fails the path.
+        """
+        if isinstance(present, (tuple, list)):
+            for pat in present:
+                if (
+                    scrape_nfs_logs(
+                        [node],
+                        pat,
+                        nfs_name=nfs_name,
+                        require_match=True,
+                        since=since,
+                    )
+                    is None
+                ):
+                    return 1
+        else:
+            present_hits = scrape_nfs_logs(
+                [node], present, nfs_name=nfs_name, since=since
+            )
+            if present_hits is None or not present_hits.get(node.hostname):
+                return 1
+
+        if isinstance(absent, (tuple, list)):
+            for pat in absent:
+                if (
+                    scrape_nfs_logs(
+                        [node],
+                        pat,
+                        nfs_name=nfs_name,
+                        require_absent=True,
+                        since=since,
+                    )
+                    is None
+                ):
+                    return 1
+        else:
+            absent_hits = scrape_nfs_logs(
+                [node], absent, nfs_name=nfs_name, since=since
+            )
+            if absent_hits is None or absent_hits.get(node.hostname):
+                return 1
+
+        log.info("%s: TSM %s path ok", node.hostname, label)
+        return 0
+
+    def assert_tsm_disable_logs(self, nfs_name, node, peers=None, since=None):
+        """Return 0 if disable markers match on recovering node and peers.
+
+        Recovering ``node``: optional TSM_DISABLE_PRESENT, plus TSM_DISABLE_ABSENT.
+        ``peers`` (if given): each must match TSM_DISABLE_PEER_PRESENT
+        (Cleaned all node state records OR TSM_DISABLE_NOTIFY).
+        """
+        log.info("TSM DISABLE-PATH LOG VALIDATION (%s on %s)", nfs_name, node.hostname)
+        for pat in TSM_DISABLE_PRESENT:
+            if (
+                scrape_nfs_logs(
+                    [node], pat, nfs_name=nfs_name, require_match=True, since=since
+                )
+                is None
+            ):
+                return 1
+        for pat in TSM_DISABLE_ABSENT:
+            if (
+                scrape_nfs_logs(
+                    [node], pat, nfs_name=nfs_name, require_absent=True, since=since
+                )
+                is None
+            ):
+                return 1
+        log.info("%s: TSM disable path ok", node.hostname)
+
+        if not peers:
+            log.error("TSM disable validation requires peers for notify/cleanup markers")
+            return 1
+        peer_list = peers if isinstance(peers, (list, tuple)) else [peers]
+        log.info(
+            "TSM disable peer markers on: %s",
+            [p.hostname for p in peer_list],
+        )
+        for pat in TSM_DISABLE_PEER_PRESENT:
+            if (
+                scrape_nfs_logs(
+                    peer_list,
+                    pat,
+                    nfs_name=nfs_name,
+                    require_match=True,
+                    since=since,
+                )
+                is None
+            ):
+                return 1
+        log.info("peers: TSM disable notify/cleanup ok")
+        return 0
+
+    def assert_tsm_primary_selection_fail_logs(self, nfs_name, node, since=None):
+        """Return 0 if all-peers-down disable markers match (no partial primary)."""
+        log.info(
+            "TSM PRIMARY-SELECTION-FAIL LOG VALIDATION (%s on %s)",
+            nfs_name,
+            node.hostname,
+        )
+        for pat in TSM_PRIMARY_SELECTION_FAIL_PRESENT:
+            if (
+                scrape_nfs_logs(
+                    [node], pat, nfs_name=nfs_name, require_match=True, since=since
+                )
+                is None
+            ):
+                return 1
+        for pat in TSM_PRIMARY_SELECTION_FAIL_ABSENT:
+            if (
+                scrape_nfs_logs(
+                    [node], pat, nfs_name=nfs_name, require_absent=True, since=since
+                )
+                is None
+            ):
+                return 1
+        log.info("%s: TSM primary-selection-fail path ok", node.hostname)
+        return 0
+
+    def assert_tsm_boot_logs(self, nfs_name, nfs_nodes, since=None):
+        """All NFS nodes must show first-boot INFO markers after initial bring-up.
+
+        Matches ``test_nfs_tsm_basic`` deploy path (before debug enable). Expects
+        on every node:
+          TSM thread is initialized, TSM_PEER_RECORD_FIRST_BOOT_DONE,
+          Total cluster size.
+        Does not forbid recovery/reaper strings — those can appear after
+        peer selection on a healthy first boot.
+        Returns 0 on success, 1 on failure.
+        """
+        log.info("TSM BOOT-PATH LOG VALIDATION (%s)", nfs_name)
+        ok_hosts = []
+        for node in nfs_nodes:
+            if (
+                self._assert_boot_path(
+                    node,
+                    nfs_name,
+                    TSM_FIRST_BOOT_PRESENT,
+                    (),
+                    since,
+                    "first-boot",
+                )
+                != 0
+            ):
+                log.error("%s: missing first-boot TSM logs", node.hostname)
+                return 1
+            ok_hosts.append(node.hostname)
+
+        log.info("TSM boot roles: all first_boot=%s", ok_hosts)
+        return 0
 
     def assert_tsm_ready(
         self,
@@ -151,38 +361,76 @@ class NfsTsmValidation:
         expect_enabled=True,
         timeout=None,
         check_peers=True,
-        log_patterns=("Enabling tsm",),
+        log_patterns=None,
         log_since=None,
+        check_boot_logs=True,
     ):
-        """Composite ready check: conf → port listen → logs → optional peer ESTAB."""
+        """Composite ready check: containers → conf → port → boot logs → peers.
+
+        Polls until NFS containers are up on the given nodes (skips hosts
+        without a container yet), then validates TSM conf, listen port,
+        first-boot logs, and optional peer ESTAB.
+
+        Returns 0 on success, 1 on failure.
+        """
         log.info("ASSERT TSM READY (%s)", nfs_name)
         port = self.tsm_port if tsm_port is None else tsm_port
         timeout = self.timeout if timeout is None else timeout
+        conf = None
+        active = []
         for _ in WaitUntil(timeout=timeout, interval=self.poll_interval):
-            try:
-                conf = self.assert_ganesha_tsm_conf(
-                    nfs_name, nfs_nodes, expect_enabled=expect_enabled,
-                    expected_tsm_port=port,
-                )
-                if expect_enabled:
-                    assert_port_listening(nfs_nodes, port, label="TSM port")
-                    if log_patterns:
+            active = [
+                n
+                for n in nfs_nodes
+                if get_nfs_container_id(n, nfs_name=nfs_name)
+            ]
+            if not active:
+                log.warning("NFS containers not up yet for %s", nfs_name)
+                continue
+            conf = self.assert_ganesha_tsm_conf(
+                nfs_name,
+                active,
+                expect_enabled=expect_enabled,
+                expected_tsm_port=port,
+            )
+            if conf is None:
+                log.warning("TSM conf not ready yet")
+                continue
+            if expect_enabled:
+                if assert_port_listening(active, port, label="TSM port"):
+                    log.warning("TSM port not listening yet")
+                    continue
+                if check_boot_logs:
+                    if self.assert_tsm_boot_logs(
+                        nfs_name, active, since=log_since
+                    ):
+                        log.warning("TSM boot logs not ready yet")
+                        continue
+                elif log_patterns:
+                    if (
                         scrape_nfs_logs(
-                            nfs_nodes,
+                            active,
                             log_patterns,
                             nfs_name=nfs_name,
                             require_match=True,
                             since=log_since,
                         )
-                break
-            except OperationFailedError as exc:
-                log.warning("TSM not ready yet: %s", exc)
+                        is None
+                    ):
+                        log.warning("TSM log patterns not ready yet")
+                        continue
+            break
         else:
-            raise OperationFailedError(
-                f"TSM ready check did not succeed within {timeout}s for nfs.{nfs_name}"
+            log.error(
+                "TSM ready check did not succeed within %ss for nfs.%s",
+                timeout,
+                nfs_name,
             )
-        if expect_enabled and check_peers and len(conf) >= 2:
-            self.assert_tsm_peer_connections(
+            return 1
+
+        if expect_enabled and check_peers and conf and len(conf) >= 2:
+            if self.assert_tsm_peer_connections(
                 [e["node"] for e in conf], tsm_port=port
-            )
-        return conf
+            ):
+                return 1
+        return 0

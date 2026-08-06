@@ -1,12 +1,28 @@
-"""NFS TSM basic enablement — multi-daemon deploy via orch spec."""
+"""NFS TSM deployment workflows.
+
+Each WORKFLOWS entry is a list of deploy steps. Each step:
+  1. Build orch NFS spec
+  2. Apply + assert_tsm_ready
+  3. Enable TSM debug logs
+
+Then: export + mount + IO, coredump check, cleanup (always in finally).
+
+Step flags: expect_deploy_fail, recreate, min_nfs_nodes, second_cluster
+"""
 
 import time
+import uuid
 
+import yaml
 from cli.ceph.ceph import Ceph
-from cli.exceptions import ConfigError, OperationFailedError
+from cli.cephadm.cephadm import CephAdm
 from cli.utilities.filesys import Mount
 from cli.utilities.utils import check_coredump_generated
-from tests.nfs.lib.common_lib import enable_nfs_debug_logs, get_node_time
+from tests.nfs.lib.common_lib import (
+    enable_nfs_debug_logs,
+    get_nfs_container_id,
+    get_node_time,
+)
 from tests.nfs.lib.multi_active.config import NfsMultiActiveConfig
 from tests.nfs.lib.tsm import NfsTsmValidation
 from tests.nfs.nfs_operations import cleanup_cluster, create_nfs_via_file_and_verify
@@ -15,123 +31,366 @@ from utility.log import Log
 log = Log(__name__)
 
 COREDUMP_PATH = "/var/lib/systemd/coredump"
+TIMEOUT = 300
+
+WORKFLOWS = {
+    "basic": [{}],
+    "placement_hosts": [{"placement": "hosts"}],
+    "placement_count": [
+        {"placement": "count", "nfs_count": 2, "min_nfs_nodes": 3}
+    ],
+    "custom_ports": [{"nfs_port": 12049, "tsm_port": 36370}],
+    "tsm_disabled": [
+        {"enable_tsm": False, "expect_enabled": None, "check_peers": False}
+    ],
+    "tsm_enable_flip": [
+        {"enable_tsm": False, "expect_enabled": None, "check_peers": False},
+        {"enable_tsm": True, "expect_enabled": True, "check_peers": True},
+    ],
+    "redeploy_tsm_port": [
+        {"tsm_port": 36369},
+        {"tsm_port": 36371},
+    ],
+    "colocation": [
+        {
+            "second_cluster": {
+                "name": "cephfs-nfs-tsmb-b",
+                "nfs_port": 2050,
+                "tsm_port": 36370,
+                "export": "/export_tsmb_b",
+                "mount": "/mnt/nfs_tsmb_b",
+            }
+        }
+    ],
+    "cleanup_recreate": [{"recreate": True}],
+}
 
 
-def run(ceph_cluster, **kw):
-    """
-    Deploy a multi-node NFS cluster via orch spec and verify TSM:
-      - enable_TSM / Tsm_Port in ganesha.conf on every daemon
-      - Tsm_Port is listening
-      - 'Enabling tsm' present in daemon logs
-      - at least one ESTAB TSM peer connection per host
-      - no NFS coredumps after IO
-    """
-    nfs_nodes = ceph_cluster.get_nodes("nfs")
-    clients = ceph_cluster.get_nodes("client")
-    installer = ceph_cluster.get_nodes("installer")[0]
-
-    port = "2049"
-    version = "4.2"
-    nfs_name = "cephfs-nfs"
-    nfs_mount = "/mnt/nfs"
-    nfs_export = "/export"
-    fs_name = "cephfs"
-    tsm_port = 36369
-    nfs_count = 2
-    timeout = 300
-
-    if len(nfs_nodes) < nfs_count:
-        raise ConfigError(
-            f"TSM basic test needs {nfs_count} NFS nodes, found {len(nfs_nodes)}"
-        )
-    if not clients:
-        raise ConfigError("At least one client node is required")
-
-    nfs_nodes = sorted(nfs_nodes, key=lambda node: node.hostname)[:nfs_count]
-    hosts = [node.hostname for node in nfs_nodes]
-    clients = clients[:1]
-
-    nfs_spec = {
+def build_spec(nfs_name, nfs_port, tsm_port, enable_tsm, count, hosts, placement):
+    """Build NFS orch spec (hosts = pinned list, count = pool with count < len)."""
+    if placement == "count":
+        if len(hosts) <= count:
+            log.error(
+                "placement count requires len(hosts) > count (hosts=%s, count=%s)",
+                len(hosts),
+                count,
+            )
+            return None
+        place = {"count": count, "hosts": list(hosts)}
+    else:
+        place = {"count": count, "hosts": hosts[:count]}
+    return {
         "service_type": "nfs",
         "service_id": nfs_name,
-        "placement": {"count": nfs_count, "hosts": hosts},
+        "placement": place,
         "spec": {
-            "port": int(port),
-            "enable_tsm": True,
-            "tsm_port": tsm_port,
+            "port": int(nfs_port),
+            "enable_tsm": bool(enable_tsm),
+            "tsm_port": int(tsm_port),
         },
     }
 
-    try:
-        log_since, coredump_since = get_node_time(nfs_nodes)
-        log.info("Deploying NFS TSM cluster via orch spec: %s", nfs_spec)
-        if not create_nfs_via_file_and_verify(
-            installer, [nfs_spec], timeout, nfs_nodes=nfs_nodes
-        ):
-            raise OperationFailedError("Failed to deploy NFS TSM cluster via spec")
 
-        enable_nfs_debug_logs(clients[0], nfs_name, "TSM")
-        time.sleep(3)
+def nodes_running_nfs(nodes, nfs_name):
+    """Return nodes that currently host the NFS container."""
+    return [n for n in nodes if get_nfs_container_id(n, nfs_name=nfs_name)]
 
-        validator = NfsTsmValidation(
-            ceph_cluster,
-            clients[0],
-            enable_tsm_key="enable_TSM",
-            tsm_port_key="Tsm_Port",
-            tsm_port=tsm_port,
+
+def deploy_step(cluster, installer, client, nodes, step, nfs_name, tag):
+    """Spec → apply → assert_tsm_ready → enable TSM debug.
+
+    Returns (coredump_since, active, nfs_port, second) or None / 'expect_deploy_fail'.
+    """
+    count = step.get("nfs_count", 2)
+    nfs_port = step.get("nfs_port", 2049)
+    tsm_port = step.get("tsm_port", 36369)
+    enable_tsm = step.get("enable_tsm", True)
+    expect_enabled = step.get("expect_enabled", enable_tsm)
+    check_peers = step.get("check_peers", count >= 2 and enable_tsm)
+    placement = step.get("placement", "hosts")
+    hosts = [n.hostname for n in nodes]
+    pool = nodes if placement == "count" else nodes[:count]
+    second = step.get("second_cluster")
+
+    log_since, coredump_since = get_node_time(pool)
+
+    specs = [
+        build_spec(nfs_name, nfs_port, tsm_port, enable_tsm, count, hosts, placement)
+    ]
+    if specs[0] is None:
+        return None
+    if second:
+        second_spec = build_spec(
+            second["name"],
+            second["nfs_port"],
+            second["tsm_port"],
+            True,
+            count,
+            hosts[:count],
+            "hosts",
         )
+        if second_spec is None:
+            return None
+        specs.append(second_spec)
 
-        validator.assert_tsm_ready(
-            nfs_name,
-            nfs_nodes,
-            expect_enabled=True,
-            check_peers=True,
-            log_patterns=None,
+    log.info("[%s] deploy %s", tag, specs)
+    if step.get("expect_deploy_fail"):
+        remote = f"/tmp/cephci_nfs_neg_{uuid.uuid4().hex}.yaml"
+        try:
+            fp = installer.remote_file(sudo=True, file_name=remote, file_mode="wb")
+            fp.write(
+                yaml.dump_all(
+                    specs, sort_keys=False, indent=2, default_flow_style=False
+                ).encode("utf-8")
+            )
+            fp.flush()
+            fp.close()
+            out, _ = installer.exec_command(sudo=True, cmd=f"cat {remote}")
+            log.info(
+                "[%s] NFS orch spec (expect apply fail):\n%s",
+                tag,
+                (out or "").strip(),
+            )
+            CephAdm(installer, mount="/tmp/").ceph.orch.apply(
+                input=remote, check_ec=True
+            )
+            log.error("[%s] orch apply succeeded but expected to fail", tag)
+            return None
+        except Exception as exc:
+            log.info("[%s] orch apply failed as expected: %s", tag, exc)
+            return "expect_deploy_fail"
+        finally:
+            installer.exec_command(sudo=True, cmd=f"rm -f {remote}", check_ec=False)
+
+    if not create_nfs_via_file_and_verify(installer, specs, TIMEOUT, nfs_nodes=pool):
+        log.error("[%s] deploy failed", tag)
+        return None
+
+    # Ready checks before debug (debug restarts Ganesha).
+    ready = [(nfs_name, tsm_port, expect_enabled, check_peers)]
+    if second:
+        ready.append((second["name"], second["tsm_port"], True, True))
+    for svc, port, exp, peers in ready:
+        if NfsTsmValidation(
+            cluster, client, "enable_TSM", "Tsm_Port", port
+        ).assert_tsm_ready(
+            svc,
+            pool,
+            tsm_port=port,
+            expect_enabled=exp,
+            check_peers=peers,
             log_since=log_since,
-        )
-
-        Ceph(clients[0]).nfs.export.create(
-            fs_name=fs_name,
-            nfs_name=nfs_name,
-            nfs_export=nfs_export,
-            fs=fs_name,
-        )
-        NfsMultiActiveConfig.wait_until_export_visible(
-            clients[0], nfs_name, nfs_export
-        )
-
-        clients[0].create_dirs(dir_path=nfs_mount, sudo=True)
-        if Mount(clients[0]).nfs(
-            mount=nfs_mount,
-            version=version,
-            port=port,
-            server=hosts[0],
-            export=nfs_export,
         ):
-            raise OperationFailedError(f"Failed to mount nfs on {clients[0].hostname}")
+            log.error("[%s] TSM ready check failed for %s", tag, svc)
+            return None
 
-        clients[0].exec_command(
-            sudo=True,
-            cmd=f"bash -c 'echo tsm-basic > {nfs_mount}/tsm_basic.txt && "
-            f"cat {nfs_mount}/tsm_basic.txt'",
+    for spec in specs:
+        enable_nfs_debug_logs(client, spec["service_id"], "TSM")
+
+    active = []
+    for _ in range(30):
+        active = nodes_running_nfs(pool, nfs_name)
+        if len(active) >= count:
+            break
+        time.sleep(2)
+    if len(active) < count:
+        log.error(
+            "[%s] NFS container not seen after debug enable (seen=%s, expected=%s)",
+            tag,
+            [n.hostname for n in active],
+            count,
         )
+        return None
 
-        for nfs_node in nfs_nodes:
-            if check_coredump_generated(
-                nfs_node, COREDUMP_PATH, coredump_since[nfs_node.hostname]
-            ):
-                raise OperationFailedError(
-                    f"Coredump generated on {nfs_node.hostname} during TSM basic test"
-                )
-        log.info("No NFS coredumps detected after IO")
+    return coredump_since, active[:count], nfs_port, second
 
-        log.info("TSM basic enablement and IO succeeded on cluster %s", nfs_name)
+
+def run_io(client, nfs_name, export, mount, nfs_port, server, tag, nfs_version="4.2"):
+    """Export + mount + write/read. Returns 0 on success, 1 on failure."""
+    try:
+        Ceph(client).nfs.export.create(
+            fs_name="cephfs", nfs_name=nfs_name, nfs_export=export, fs="cephfs"
+        )
+        NfsMultiActiveConfig.wait_until_export_visible(client, nfs_name, export)
+        client.create_dirs(dir_path=mount, sudo=True)
+        if Mount(client).nfs(
+            mount=mount,
+            version=str(nfs_version),
+            port=str(nfs_port),
+            server=server,
+            export=export,
+        ):
+            log.error("[%s] Failed to mount nfs on %s", tag, client.hostname)
+            return 1
+        client.exec_command(
+            sudo=True,
+            cmd=f"bash -c 'echo {tag} > {mount}/{tag}.txt && cat {mount}/{tag}.txt'",
+        )
         return 0
-    except (ConfigError, OperationFailedError) as exc:
-        log.error("TSM basic test failed: %s", exc)
-        return 1
     except Exception as exc:
-        log.exception("Unexpected failure in TSM basic test: %s", exc)
+        log.error("[%s] IO failed: %s", tag, exc)
         return 1
+
+
+def check_coredumps(nodes, since, tag):
+    """Return 0 if ok, 1 if a new coredump appeared."""
+    for node in nodes:
+        ts = since.get(node.hostname)
+        if ts and check_coredump_generated(node, COREDUMP_PATH, ts):
+            log.error("[%s] coredump on %s", tag, node.hostname)
+            return 1
+    log.info("[%s] no coredumps", tag)
+    return 0
+
+
+def safe_cleanup(client, mount, nfs_name, export, nodes, steps=None):
+    """Cleanup NFS cluster(s). Pass steps to also remove any second_cluster."""
+    clusters = [(mount, nfs_name, export)]
+    for step in steps or []:
+        second = step.get("second_cluster")
+        if second:
+            clusters.append((second["mount"], second["name"], second["export"]))
+    for mnt, name, exp in clusters:
+        try:
+            cleanup_cluster([client], mnt, name, exp, nfs_nodes=nodes)
+        except Exception as exc:
+            log.warning("[%s] cleanup: %s", name, exc)
+
+
+def run_workflow(cluster, installer, client, all_nodes, name, steps, nfs_version="4.2"):
+    """Deploy step(s) → IO → coredump → cleanup (always)."""
+    min_nodes = max(s.get("min_nfs_nodes", 1) for s in steps)
+    if len(all_nodes) < min_nodes:
+        log.warning("[%s] skip (need %s NFS nodes)", name, min_nodes)
+        return "skipped"
+
+    need = max(max(s.get("nfs_count", 2), s.get("min_nfs_nodes", 1)) for s in steps)
+    nodes = sorted(all_nodes, key=lambda n: n.hostname)[:need]
+    nfs_name = f"cephfs-nfs-tsmb-{name}"
+    export = f"/export_tsmb_{name}"
+    mount = f"/mnt/nfs_tsmb_{name}"
+    recreate = any(s.get("recreate") for s in steps)
+
+    def once(tag):
+        coredump_since, active, nfs_port, second = {}, nodes, 2049, None
+        for i, step in enumerate(steps):
+            result = deploy_step(
+                cluster, installer, client, nodes, step, nfs_name, f"{tag}-step{i}"
+            )
+            if result is None:
+                return 1
+            if result == "expect_deploy_fail":
+                return 0
+            coredump_since, active, nfs_port, second = result
+
+        io_targets = [
+            (nfs_name, export, mount, nfs_port, tag),
+        ]
+        if second:
+            io_targets.append(
+                (
+                    second["name"],
+                    second["export"],
+                    second["mount"],
+                    second["nfs_port"],
+                    f"{tag}_b",
+                )
+            )
+        for svc, exp, mnt, port, io_tag in io_targets:
+            if run_io(
+                client,
+                svc,
+                exp,
+                mnt,
+                port,
+                active[0].hostname,
+                io_tag,
+                nfs_version=nfs_version,
+            ):
+                return 1
+        return check_coredumps(active, coredump_since, tag)
+
+    try:
+        if once(name):
+            log.error("[%s] FAILED", name)
+            return "failed"
+        if recreate:
+            safe_cleanup(client, mount, nfs_name, export, nodes, steps=steps)
+            time.sleep(5)
+            if once(f"{name}_recreate"):
+                log.error("[%s] FAILED on recreate", name)
+                return "failed"
+        log.info("[%s] PASSED", name)
+        return "passed"
+    except Exception as exc:
+        log.error("[%s] FAILED: %s", name, exc)
+        return "failed"
     finally:
-        cleanup_cluster(clients, nfs_mount, nfs_name, nfs_export, nfs_nodes=nfs_nodes)
+        safe_cleanup(client, mount, nfs_name, export, nodes, steps=steps)
+
+
+def execute_workflows(
+    ceph_cluster,
+    workflows,
+    summary_title="TSM WORKFLOW SUMMARY",
+    handlers=None,
+    nfs_version="4.2",
+):
+    """Run workflows; always print summary. Return 0 if none failed."""
+    nfs_nodes = ceph_cluster.get_nodes("nfs")
+    clients = ceph_cluster.get_nodes("client")
+    installer = ceph_cluster.get_nodes("installer")[0]
+    if not nfs_nodes or not clients:
+        log.error("Need ≥1 NFS node and ≥1 client")
+        return 1
+
+    handlers = handlers or {}
+    results = {}
+    for i, (name, steps) in enumerate(workflows.items(), 1):
+        log.info(
+            "\n==============================\n"
+            "Test %s: TSM workflow [%s]\n"
+            "==============================",
+            i,
+            name,
+        )
+        try:
+            runner = handlers.get(name, run_workflow)
+            results[name] = runner(
+                ceph_cluster,
+                installer,
+                clients[0],
+                nfs_nodes,
+                name,
+                steps,
+                nfs_version=nfs_version,
+            )
+        except Exception as exc:
+            log.error("[%s] FAILED: %s", name, exc)
+            results[name] = "failed"
+
+    passed = [n for n, s in results.items() if s == "passed"]
+    failed = [n for n, s in results.items() if s == "failed"]
+    skipped = [n for n, s in results.items() if s == "skipped"]
+    log.info(
+        "\n%s\n%s\n%s\n%s\n%s\n%s",
+        "=" * 60,
+        summary_title,
+        "=" * 60,
+        "\n".join(f"  {n:<24} {s.upper()}" for n, s in results.items()),
+        "-" * 60
+        + f"\n  Total: {len(results)}  Passed: {len(passed)}  "
+        f"Failed: {len(failed)}  Skipped: {len(skipped)}",
+        "=" * 60,
+    )
+    return 1 if failed else 0
+
+
+def run(ceph_cluster, **kw):
+    config = kw.get("config") or {}
+    return execute_workflows(
+        ceph_cluster,
+        WORKFLOWS,
+        "TSM DEPLOYMENT WORKFLOW SUMMARY",
+        nfs_version=str(config.get("nfs_version", "4.2")),
+    )
