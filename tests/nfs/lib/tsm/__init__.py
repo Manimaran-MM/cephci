@@ -1,7 +1,29 @@
 """NFS TSM helpers: validation utilities."""
 
+from tests.nfs.lib.tsm.constants import (
+    TSM_DISABLE_ABSENT,
+    TSM_DISABLE_PEER_PRESENT,
+    TSM_DISABLE_PRESENT,
+    TSM_FIRST_BOOT_ABSENT,
+    TSM_FIRST_BOOT_PRESENT,
+    TSM_PRIMARY_SELECTION_FAIL_ABSENT,
+    TSM_PRIMARY_SELECTION_FAIL_PRESENT,
+    TSM_RECOVERY_ABSENT,
+    TSM_RECOVERY_PRESENT,
+    NfsFcntlLock,
+)
 from tests.nfs.lib.tsm.validation import NfsTsmValidation
 
 __all__ = [
+    "NfsFcntlLock",
     "NfsTsmValidation",
+    "TSM_DISABLE_ABSENT",
+    "TSM_DISABLE_PEER_PRESENT",
+    "TSM_DISABLE_PRESENT",
+    "TSM_FIRST_BOOT_ABSENT",
+    "TSM_FIRST_BOOT_PRESENT",
+    "TSM_PRIMARY_SELECTION_FAIL_ABSENT",
+    "TSM_PRIMARY_SELECTION_FAIL_PRESENT",
+    "TSM_RECOVERY_ABSENT",
+    "TSM_RECOVERY_PRESENT",
 ]
