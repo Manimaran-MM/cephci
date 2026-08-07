@@ -1,49 +1,15 @@
-"""TSM boot-path log markers for first-boot vs recovery validation."""
+"""TSM log markers and hold-command builders for NFS TSM tests."""
+
+import re
 
 # ---------------------------------------------------------------------------
 # First-boot path (initial orch apply / NFS bring-up)
 # INFO-level markers visible before COMPONENT_TSM debug is enabled.
-# Bring-up (assert_tsm_boot_logs / assert_tsm_ready) checks PRESENT only.
-# ABSENT is reserved for stricter path discrimination if needed elsewhere —
-# do not use it on cold start (reaper may log "Got back the primary..." after
-# peer selection without that being a recovery-path boot).
 # ---------------------------------------------------------------------------
 TSM_FIRST_BOOT_PRESENT = (
     "TSM thread is initialized",
     "TSM_PEER_RECORD_FIRST_BOOT_DONE",
     "Total cluster size",
-)
-
-TSM_FIRST_BOOT_ABSENT = (
-    r"TSM_PEER_RECORD_RECOVERY_DONE|"
-    r"Full recovery successful|"
-    r"Got back the primary and secondary|"
-    r"GET_STATE ACK completed|"
-    r"TSM_PEER_RECORD_RECOVERY_FAILED|"
-    r"TSM_DISABLE_NOTIFY|"
-    r"Cleaned all node state|"
-    r"Disabling tsm: No primary"
-)
-
-# ---------------------------------------------------------------------------
-# Recovery path (peers already had primary/secondary)
-# ---------------------------------------------------------------------------
-TSM_RECOVERY_PRESENT = (
-    r"TSM_PEER_RECORD_RECOVERY_DONE|"
-    r"Full recovery successful|"
-    r"Got back the primary and secondary|"
-    r"GET_STATE ACK completed"
-)
-
-TSM_RECOVERY_ABSENT = (
-    r"TSM_PEER_RECORD_FIRST_BOOT_DONE|"
-    r"Broadcasting TSM_PEER_IP_NOTIFY|"
-    r"Signalling Peer ping|"
-    r"Received peer ping ACK|"
-    r"TSM_PEER_RECORD_RECOVERY_FAILED|"
-    r"TSM_DISABLE_NOTIFY|"
-    r"Cleaned all node state|"
-    r"Disabling tsm: No primary"
 )
 
 # ---------------------------------------------------------------------------
@@ -79,6 +45,45 @@ TSM_PRIMARY_SELECTION_FAIL_ABSENT = (
     "Primary index",
     "Secondary index",
 )
+
+# ---------------------------------------------------------------------------
+# Delegation log scrape (podman logs / ganesha) for TSM+deleg workflows
+# ---------------------------------------------------------------------------
+DELEG_LOG_RE = re.compile(
+    r"OPEN handler|END OF nfs4_op_open|CLOSE handler|successfully recalled|"
+    r"DELEGRETURN|OP_DELEGRETURN|Recalling|Revoking|delegation_type|"
+    r"Attempting to grant delegation|Delegation type not supported",
+    re.I,
+)
+
+
+class NfsFdHold:
+    """Bash FD open-hold commands (open/deleg only — no fcntl lock).
+
+    Keep the FD open with ``sleep infinity`` until ``NfsFcntlLock.kill_pid``.
+    Use ``NfsFcntlLock`` when the workflow also needs lock counts.
+    """
+
+    @staticmethod
+    def write_create(path):
+        """Create/truncate + write-open hold."""
+        return f"bash -c 'exec 3>{path}; echo held >&3; sleep infinity'"
+
+    @staticmethod
+    def write_append(path, text="more"):
+        """Append-open hold (often used as a second-client conflict)."""
+        safe = str(text).replace("'", "'\\''")
+        return f"bash -c 'exec 3>>{path}; echo {safe} >&3; sleep infinity'"
+
+    @staticmethod
+    def read_open(path):
+        """Read-only open hold."""
+        return f"bash -c 'exec 3<{path}; sleep infinity'"
+
+    @staticmethod
+    def write_rw(path):
+        """Read+write open hold."""
+        return f"bash -c 'exec 3<>{path}; echo x >&3; sleep infinity'"
 
 
 class NfsFcntlLock:

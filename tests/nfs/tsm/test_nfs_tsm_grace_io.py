@@ -9,29 +9,31 @@ TC-TSM-G-O01: Client A write-open hold → peer open sync → restart into grace
 """
 
 import json
-import re
-import shlex
 import time
 
-from cli.ceph.ceph import Ceph
-from cli.utilities.filesys import Mount
 from tests.nfs.lib.common_lib import get_nfs_container_id, get_node_time, scrape_nfs_logs
-from tests.nfs.lib.multi_active.config import NfsMultiActiveConfig
-from tests.nfs.lib.tsm.constants import NfsFcntlLock
+from tests.nfs.lib.tsm.helpers import (
+    POLL_INTERVAL,
+    POLL_TIMEOUT,
+    announce,
+    check_coredumps,
+    fmt_tsm,
+    kill_holds as _kill_holds,
+    log_workflow_summary,
+    mount_clients as _mount_clients,
+    peer_summary as _peer_summary,
+    start_bg as _bg,
+    wait_peer_counts,
+)
 from tests.nfs.tsm.test_nfs_tsm_basic import deploy_step, safe_cleanup
 from utility.log import Log
 
 log = Log(__name__)
 
-SUMMARY_RE = re.compile(
-    r"Tsm record summary total=(\d+) open=(\d+) lock=(\d+) deleg=(\d+)", re.I
-)
 GRACE_IN_RE = r"NFS Server Now IN GRACE"
 GRACE_OUT_RE = r"NFS Server Now NOT IN GRACE"
 
 TSM_PORT = 36369
-POLL_TIMEOUT = 90
-POLL_INTERVAL = 3
 GRACE_TIMEOUT = 120
 CONTAINER_TIMEOUT = 120
 
@@ -77,66 +79,18 @@ class GraceCtx:
 
 
 # ---------------------------------------------------------------------------
-# Peer TSM record helpers (same log format as record_validation)
+# Peer TSM record helpers (shared via lib/tsm/helpers.py)
 # ---------------------------------------------------------------------------
-def _peer_summary(peers, nfs_name, since=None):
-    """Parse last matching peer TSM summary line across peers."""
-    counts = {"total": 0, "open": 0, "lock": 0, "deleg": 0, "seen": False}
-    for node in peers:
-        cid = get_nfs_container_id(node, nfs_name=nfs_name)
-        if not cid:
-            continue
-        node_since = since.get(node.hostname) if isinstance(since, dict) else since
-        since_arg = f' --since "{node_since}"' if node_since else ""
-        out, _ = node.exec_command(
-            sudo=True, cmd=f"podman logs{since_arg} {cid} 2>&1", check_ec=False
-        )
-        lines = [ln for ln in (out or "").splitlines() if SUMMARY_RE.search(ln)]
-        log.info(
-            "TSM record summary on %s:\n%s",
-            node.hostname,
-            "\n".join(lines[-3:]) if lines else "<none>",
-        )
-        if not lines:
-            continue
-        m = SUMMARY_RE.search(lines[-1])
-        if not m:
-            continue
-        counts["seen"] = True
-        counts["total"] = max(counts["total"], int(m.group(1)))
-        counts["open"] = max(counts["open"], int(m.group(2)))
-        counts["lock"] = max(counts["lock"], int(m.group(3)))
-        counts["deleg"] = max(counts["deleg"], int(m.group(4)))
-    return counts
-
-
 def _wait_counts(peers, nfs_name, since, expect_open, expect_lock, label):
     """Poll peer summaries until open/lock match expected values."""
-    deadline = time.time() + POLL_TIMEOUT
-    last = None
-    while time.time() < deadline:
-        last = _peer_summary(peers, nfs_name, since=since)
-        if (
-            last.get("seen")
-            and last["open"] == expect_open
-            and last["lock"] == expect_lock
-        ):
-            log.info(
-                "[%s] peer summary ok (open=%s lock=%s)",
-                label,
-                expect_open,
-                expect_lock,
-            )
-            return 0
-        time.sleep(POLL_INTERVAL)
-    log.error(
-        "[%s] peer summary timeout: want open=%s lock=%s last=%s",
-        label,
-        expect_open,
-        expect_lock,
-        last,
+    return (
+        0
+        if wait_peer_counts(
+            peers, nfs_name, since, expect_open, expect_lock, label
+        )
+        is not None
+        else 1
     )
-    return 1
 
 
 def _wait_open_at_least(peers, nfs_name, since, min_open, label):
@@ -158,31 +112,11 @@ def _wait_open_at_least(peers, nfs_name, since, min_open, label):
 # ---------------------------------------------------------------------------
 # Hold / kill helpers
 # ---------------------------------------------------------------------------
-def _bg(client, cmd):
-    """Start cmd in background; return pid string or None."""
-    out, _ = client.exec_command(
-        sudo=True,
-        cmd=f"nohup bash -c {shlex.quote(cmd)} >/dev/null 2>&1 & echo $!",
-        check_ec=False,
-    )
-    pid = (out or "").strip().splitlines()[-1] if out else ""
-    if not pid.isdigit():
-        log.error("Failed to start bg on %s: %r cmd=%r", client.hostname, out, cmd)
-        return None
-    log.info("Started pid=%s on %s: %s", pid, client.hostname, cmd)
-    return pid
-
-
 def _pid_alive(client, pid):
     out, _ = client.exec_command(
         sudo=True, cmd=f"kill -0 {pid} 2>/dev/null && echo alive", check_ec=False
     )
     return "alive" in (out or "")
-
-
-def _kill_holds(holds):
-    for client, pid in holds:
-        NfsFcntlLock.kill_pid(client, pid)
 
 
 # ---------------------------------------------------------------------------
@@ -277,6 +211,10 @@ def tc_tsm_g_o01(ctx):
     log.info("[%s] baseline open=%s", tag, base_open)
 
     hold_since, _ = get_node_time(ctx.peers)
+    announce(
+        "Do open + hold [%s]" % tag,
+        fmt_tsm(base_open + 1, baseline.get("lock", 0) if baseline.get("seen") else 0),
+    )
     pid = _bg(client, hold_cmd)
     if not pid:
         return 1
@@ -359,25 +297,6 @@ WORKFLOWS = {
 }
 
 
-def _mount_clients(clients, nfs_name, export, mount, nfs_port, server, nfs_version="4.2"):
-    Ceph(clients[0]).nfs.export.create(
-        fs_name="cephfs", nfs_name=nfs_name, nfs_export=export, fs="cephfs"
-    )
-    NfsMultiActiveConfig.wait_until_export_visible(clients[0], nfs_name, export)
-    for client in clients:
-        client.create_dirs(dir_path=mount, sudo=True)
-        if Mount(client).nfs(
-            mount=mount,
-            version=str(nfs_version),
-            port=str(nfs_port),
-            server=server,
-            export=export,
-        ):
-            log.error("Mount failed on %s", client.hostname)
-            return 1
-    return 0
-
-
 def run(ceph_cluster, **kw):
     """Deploy TSM once, run all registered grace WORKFLOWS, then cleanup."""
     config = kw.get("config") or {}
@@ -449,6 +368,7 @@ def run(ceph_cluster, **kw):
         )
 
         cases = selected or list(WORKFLOWS.keys())
+        _, coredump_since = get_node_time(nodes)
         for i, tc_id in enumerate(cases, 1):
             spec = WORKFLOWS.get(tc_id)
             if not spec:
@@ -468,6 +388,7 @@ def run(ceph_cluster, **kw):
                 tc_id,
                 spec.get("desc", ""),
             )
+            announce("Do workflow [%s] — %s" % (tc_id, spec.get("desc", "")))
             # Drop holds from previous TC before next
             if ctx.holds:
                 _kill_holds(ctx.holds)
@@ -480,6 +401,11 @@ def run(ceph_cluster, **kw):
             except Exception as exc:
                 log.error("[%s] FAILED: %s", tc_id, exc)
                 results[tc_id] = "failed"
+            if results[tc_id] == "passed" and check_coredumps(
+                nodes, coredump_since, tc_id
+            ):
+                results[tc_id] = "failed"
+            _, coredump_since = get_node_time(nodes)
     except Exception as exc:
         log.error("Grace IO suite FAILED: %s", exc)
         return 1
@@ -494,24 +420,4 @@ def run(ceph_cluster, **kw):
                 check_ec=False,
             )
 
-    passed = [n for n, s in results.items() if s == "passed"]
-    failed = [n for n, s in results.items() if s == "failed"]
-    skipped = [n for n, s in results.items() if s == "skipped"]
-    lines = [
-        "",
-        "=" * 60,
-        "TSM GRACE IO SUMMARY",
-        "=" * 60,
-    ]
-    for n, s in results.items():
-        lines.append(f"  {n:<28} {s.upper()}")
-    lines.extend(
-        [
-            "-" * 60,
-            f"  Total: {len(results)}  Passed: {len(passed)}  "
-            f"Failed: {len(failed)}  Skipped: {len(skipped)}",
-            "=" * 60,
-        ]
-    )
-    log.info("\n".join(lines))
-    return 1 if failed else 0
+    return log_workflow_summary(results, title="TSM GRACE IO SUMMARY")
