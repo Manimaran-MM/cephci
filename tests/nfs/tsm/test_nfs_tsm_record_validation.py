@@ -8,25 +8,26 @@ Deploy a 2-daemon TSM cluster once, mount, then for each workflow:
 After all workflows: close every PID, wait for baseline, then cleanup.
 """
 
-import re
-import shlex
 import time
 
-from cli.ceph.ceph import Ceph
-from cli.utilities.filesys import Mount
-from tests.nfs.lib.common_lib import get_nfs_container_id, get_node_time
-from tests.nfs.lib.multi_active.config import NfsMultiActiveConfig
-from tests.nfs.lib.tsm.constants import NfsFcntlLock
+from tests.nfs.lib.common_lib import get_node_time
+from tests.nfs.lib.tsm.constants import NfsFcntlLock, NfsFdHold
+from tests.nfs.lib.tsm.helpers import (
+    announce,
+    check_coredumps,
+    fmt_tsm,
+    kill_holds as _kill_holds,
+    log_workflow_summary,
+    mount_clients as _mount_clients,
+    peer_summary as _peer_summary,
+    start_bg as _bg,
+    wait_peer_counts,
+)
 from tests.nfs.tsm.test_nfs_tsm_basic import deploy_step, safe_cleanup
 from utility.log import Log
 
 log = Log(__name__)
 
-SUMMARY_RE = re.compile(
-    r"Tsm record summary total=(\d+) open=(\d+) lock=(\d+) deleg=(\d+)", re.I
-)
-POLL_TIMEOUT = 90
-POLL_INTERVAL = 3
 NFS_PORT = 12050
 TSM_PORT = 36371
 
@@ -40,7 +41,7 @@ WORKFLOWS = {
         "delta_open": 1,
         "delta_lock": 0,
         "cmds": [
-            "bash -c 'exec 3>{mount}/tsm_hold.txt; echo held >&3; sleep infinity'",
+            NfsFdHold.write_create("{mount}/tsm_hold.txt"),
         ],
     },
     # Second write-open hold — open +1
@@ -48,7 +49,7 @@ WORKFLOWS = {
         "delta_open": 1,
         "delta_lock": 0,
         "cmds": [
-            "bash -c 'exec 3>{mount}/tsm_hold_close.txt; echo held >&3; sleep infinity'",
+            NfsFdHold.write_create("{mount}/tsm_hold_close.txt"),
         ],
     },
     # Read-only open (share_access=1) — open +1
@@ -59,7 +60,7 @@ WORKFLOWS = {
             "bash -c 'echo data > {mount}/r_base.txt'",
         ],
         "cmds": [
-            "bash -c 'exec 3<{mount}/r_base.txt; sleep infinity'",
+            NfsFdHold.read_open("{mount}/r_base.txt"),
         ],
     },
     # Read+write open — open +1
@@ -67,7 +68,7 @@ WORKFLOWS = {
         "delta_open": 1,
         "delta_lock": 0,
         "cmds": [
-            "bash -c 'exec 3<>{mount}/rw_$$.txt; echo x >&3; sleep infinity'",
+            NfsFdHold.write_rw("{mount}/rw_$$.txt"),
         ],
     },
     # Open + exclusive fcntl lock — open +1, lock +1
@@ -96,7 +97,7 @@ WORKFLOWS = {
             "bash -c 'touch {mount}/multi_owner.txt; chmod 666 {mount}/multi_owner.txt'",
         ],
         "cmds": [
-            "bash -c 'exec 3>{mount}/multi_owner.txt; sleep infinity'",
+            NfsFdHold.write_create("{mount}/multi_owner.txt"),
             "bash -c 'sudo -u testuser bash -c \"exec 3<{mount}/multi_owner.txt; sleep infinity\"'",
         ],
     },
@@ -109,8 +110,8 @@ WORKFLOWS = {
             "bash -c 'touch {mount}/share.txt; chmod 666 {mount}/share.txt'",
         ],
         "cmds": [
-            {"client": 0, "cmd": "bash -c 'exec 3>{mount}/share.txt; sleep infinity'"},
-            {"client": 1, "cmd": "bash -c 'exec 3>>{mount}/share.txt; sleep infinity'"},
+            {"client": 0, "cmd": NfsFdHold.write_create("{mount}/share.txt")},
+            {"client": 1, "cmd": NfsFdHold.write_append("{mount}/share.txt")},
         ],
     },
     # mmap hold — open +1
@@ -186,7 +187,7 @@ WORKFLOWS = {
             "bash -c 'echo seed > {mount}/append.txt'",
         ],
         "cmds": [
-            "bash -c 'exec 3>>{mount}/append.txt; echo more >&3; sleep infinity'",
+            NfsFdHold.write_append("{mount}/append.txt"),
         ],
     },
     # Non-overlapping byte-range locks — expect open +2, lock +2
@@ -365,76 +366,16 @@ WORKFLOWS = {
 }
 
 
-def _peer_summary(peers, nfs_name, since=None):
-    """Parse last matching peer TSM summary line."""
-    counts = {"total": 0, "open": 0, "lock": 0, "deleg": 0, "seen": False}
-    for node in peers:
-        cid = get_nfs_container_id(node, nfs_name=nfs_name)
-        if not cid:
-            continue
-        node_since = since.get(node.hostname) if isinstance(since, dict) else since
-        since_arg = f' --since "{node_since}"' if node_since else ""
-        out, _ = node.exec_command(
-            sudo=True, cmd=f"podman logs{since_arg} {cid} 2>&1", check_ec=False
-        )
-        lines = [ln for ln in (out or "").splitlines() if SUMMARY_RE.search(ln)]
-        log.info(
-            "TSM record summary on %s:\n%s",
-            node.hostname,
-            "\n".join(lines[-3:]) if lines else "<none>",
-        )
-        if not lines:
-            continue
-        m = SUMMARY_RE.search(lines[-1])
-        if not m:
-            continue
-        counts["seen"] = True
-        counts["total"] = max(counts["total"], int(m.group(1)))
-        counts["open"] = max(counts["open"], int(m.group(2)))
-        counts["lock"] = max(counts["lock"], int(m.group(3)))
-        counts["deleg"] = max(counts["deleg"], int(m.group(4)))
-    return counts
-
-
 def _wait_counts(peers, nfs_name, since, expect_open, expect_lock, label):
     """Poll until last summary open/lock match expected. Return 0 ok, 1 timeout."""
-    deadline = time.time() + POLL_TIMEOUT
-    while time.time() < deadline:
-        last = _peer_summary(peers, nfs_name, since=since)
-        if (
-            last.get("seen")
-            and last["open"] == expect_open
-            and last["lock"] == expect_lock
-        ):
-            log.info(
-                "[%s] peer summary ok (open=%s lock=%s)",
-                label,
-                expect_open,
-                expect_lock,
-            )
-            return 0
-        time.sleep(POLL_INTERVAL)
-    log.error(
-        "[%s] peer summary timeout: want open=%s lock=%s (see dumped lines above)",
-        label,
-        expect_open,
-        expect_lock,
+    return (
+        0
+        if wait_peer_counts(
+            peers, nfs_name, since, expect_open, expect_lock, label
+        )
+        is not None
+        else 1
     )
-    return 1
-
-
-def _bg(client, cmd):
-    out, _ = client.exec_command(
-        sudo=True,
-        cmd=f"nohup bash -c {shlex.quote(cmd)} >/dev/null 2>&1 & echo $!",
-        check_ec=False,
-    )
-    pid = (out or "").strip().splitlines()[-1] if out else ""
-    if not pid.isdigit():
-        log.error("Failed to start bg on %s: %r cmd=%r", client.hostname, out, cmd)
-        return None
-    log.info("Started pid=%s on %s: %s", pid, client.hostname, cmd)
-    return pid
 
 
 def _fmt(cmd, mount):
@@ -465,11 +406,6 @@ def _start_holds(clients, cmds, mount):
     return started
 
 
-def _kill_holds(holds):
-    for client, pid in holds:
-        NfsFcntlLock.kill_pid(client, pid)
-
-
 def _run_two_locks_unlock(clients, peers, nfs_name, mount, cur_open, cur_lock):
     """A holds exclusive lock; B OPEN then CLOSE while blocked → net open +1."""
     lockfile = f"{mount}/lock_pair_{int(time.time())}.txt"
@@ -478,6 +414,10 @@ def _run_two_locks_unlock(clients, peers, nfs_name, mount, cur_open, cur_lock):
     a_pid = _bg(clients[0], NfsFcntlLock.exclusive_hold(lockfile))
     if not a_pid:
         return "failed", []
+    announce(
+        "Do lock hold [two_locks_unlock:A]",
+        fmt_tsm(cur_open + 1, cur_lock + 1),
+    )
     if _wait_counts(
         peers,
         nfs_name,
@@ -489,6 +429,10 @@ def _run_two_locks_unlock(clients, peers, nfs_name, mount, cur_open, cur_lock):
         return "failed", [(clients[0], a_pid)]
 
     b_since, _ = get_node_time(peers)
+    announce(
+        "Do lock hold [two_locks_unlock:B]",
+        fmt_tsm(cur_open + 1, cur_lock + 1),
+    )
     b_pid = _bg(clients[1], NfsFcntlLock.exclusive_hold(lockfile))
     if not b_pid:
         return "failed", [(clients[0], a_pid)]
@@ -525,6 +469,10 @@ def _run_byte_range_overlap_block(clients, peers, nfs_name, mount, cur_open, cur
     a_pid = _bg(clients[0], NfsFcntlLock.byte_range_hold(path, 100, 0))
     if not a_pid:
         return "failed", []
+    announce(
+        "Do byte-range hold [overlap:A]",
+        fmt_tsm(cur_open + 1, cur_lock + 1),
+    )
     if _wait_counts(
         peers,
         nfs_name,
@@ -560,6 +508,10 @@ def _run_unlock_without_close(clients, peers, nfs_name, mount, cur_open, cur_loc
     """LOCK_EX then LOCK_UN; FD stays open → open +1, lock back to cur."""
     path = f"{mount}/unlock_hold.txt"
     hold_since, _ = get_node_time(peers)
+    announce(
+        "Do lock-then-unlock hold [unlock_without_close]",
+        fmt_tsm(cur_open + 1, cur_lock + 1),
+    )
     pid = _bg(
         clients[0],
         NfsFcntlLock.exclusive_then_unlock_hold(path, hold_secs=8),
@@ -624,6 +576,10 @@ def run_one(name, spec, clients, peers, nfs_name, mount, cur_open, cur_lock, sin
 
     want_open = cur_open + spec.get("delta_open", 0)
     want_lock = cur_lock + spec.get("delta_lock", 0)
+    announce(
+        "Do open/hold [%s]" % name,
+        fmt_tsm(want_open, want_lock),
+    )
     hold_since, _ = get_node_time(peers)
     started = _start_holds(clients, spec.get("cmds", []), mount)
     if started is None:
@@ -652,6 +608,10 @@ def run_one(name, spec, clients, peers, nfs_name, mount, cur_open, cur_lock, sin
 
 
 def _close_all_and_validate(holds, peers, nfs_name, baseline_open, baseline_lock):
+    announce(
+        "Do CLOSE / release hold(s)",
+        fmt_tsm(baseline_open, baseline_lock),
+    )
     log.info(
         "\n==============================\n"
         "Test close: final close/unlock of %s held pid(s)\n"
@@ -669,40 +629,8 @@ def _close_all_and_validate(holds, peers, nfs_name, baseline_open, baseline_lock
     return 0
 
 
-def _mount_clients(clients, nfs_name, export, mount, nfs_port, server, nfs_version="4.2"):
-    Ceph(clients[0]).nfs.export.create(
-        fs_name="cephfs", nfs_name=nfs_name, nfs_export=export, fs="cephfs"
-    )
-    NfsMultiActiveConfig.wait_until_export_visible(clients[0], nfs_name, export)
-    for client in clients:
-        client.create_dirs(dir_path=mount, sudo=True)
-        if Mount(client).nfs(
-            mount=mount,
-            version=str(nfs_version),
-            port=str(nfs_port),
-            server=server,
-            export=export,
-        ):
-            log.error("Mount failed on %s", client.hostname)
-            return 1
-    return 0
-
-
 def _log_summary(results):
-    passed = [n for n, s in results.items() if s == "passed"]
-    failed = [n for n, s in results.items() if s == "failed"]
-    skipped = [n for n, s in results.items() if s == "skipped"]
-    log.info(
-        "\n%s\nTSM RECORD VALIDATION SUMMARY\n%s\n%s\n%s\n%s",
-        "=" * 60,
-        "=" * 60,
-        "\n".join(f"  {n:<28} {s.upper()}" for n, s in results.items()),
-        "-" * 60
-        + f"\n  Total: {len(results)}  Passed: {len(passed)}  "
-        f"Failed: {len(failed)}  Skipped: {len(skipped)}",
-        "=" * 60,
-    )
-    return 1 if failed else 0
+    return log_workflow_summary(results, title="TSM RECORD VALIDATION SUMMARY")
 
 
 def run(ceph_cluster, **kw):
@@ -761,6 +689,7 @@ def run(ceph_cluster, **kw):
         cur_open, cur_lock = baseline["open"], baseline["lock"]
         log.info("Initial baseline: open=%s lock=%s", cur_open, cur_lock)
 
+        _, coredump_since = get_node_time(nodes)
         for i, (wf_name, spec) in enumerate(WORKFLOWS.items(), 1):
             status, holds = run_one(
                 wf_name,
@@ -774,8 +703,11 @@ def run(ceph_cluster, **kw):
                 since,
                 test_num=i,
             )
+            if status == "passed" and check_coredumps(nodes, coredump_since, wf_name):
+                status = "failed"
             results[wf_name] = status
             all_holds.extend(holds)
+            _, coredump_since = get_node_time(nodes)
             if holds:
                 snap = _peer_summary(peers, nfs_name, since=since)
                 if snap.get("seen"):
@@ -800,6 +732,10 @@ def run(ceph_cluster, **kw):
         else:
             results["final_close"] = "passed"
             all_holds = []  # already killed in close step
+        if results.get("final_close") == "passed" and check_coredumps(
+            nodes, coredump_since, "final_close"
+        ):
+            results["final_close"] = "failed"
 
         rc = _log_summary(results)
     except Exception as exc:

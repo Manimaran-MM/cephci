@@ -10,8 +10,8 @@ from tests.nfs.lib.tsm.constants import (
     TSM_DISABLE_PEER_PRESENT,
     TSM_PRIMARY_SELECTION_FAIL_PRESENT,
 )
+from tests.nfs.lib.tsm.helpers import check_coredumps
 from tests.nfs.tsm.test_nfs_tsm_basic import (
-    check_coredumps,
     deploy_step,
     execute_workflows,
     run_io,

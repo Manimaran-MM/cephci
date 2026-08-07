@@ -17,7 +17,6 @@ import yaml
 from cli.ceph.ceph import Ceph
 from cli.cephadm.cephadm import CephAdm
 from cli.utilities.filesys import Mount
-from cli.utilities.utils import check_coredump_generated
 from tests.nfs.lib.common_lib import (
     enable_nfs_debug_logs,
     get_nfs_container_id,
@@ -25,12 +24,12 @@ from tests.nfs.lib.common_lib import (
 )
 from tests.nfs.lib.multi_active.config import NfsMultiActiveConfig
 from tests.nfs.lib.tsm import NfsTsmValidation
+from tests.nfs.lib.tsm.helpers import announce, check_coredumps, log_workflow_summary
 from tests.nfs.nfs_operations import cleanup_cluster, create_nfs_via_file_and_verify
 from utility.log import Log
 
 log = Log(__name__)
 
-COREDUMP_PATH = "/var/lib/systemd/coredump"
 TIMEOUT = 300
 
 WORKFLOWS = {
@@ -97,7 +96,10 @@ def nodes_running_nfs(nodes, nfs_name):
 
 
 def deploy_step(cluster, installer, client, nodes, step, nfs_name, tag):
-    """Spec → apply → assert_tsm_ready → enable TSM debug.
+    """Spec → apply → assert_tsm_ready → optionally enable TSM debug.
+
+    Set ``step["enable_debug"]=False`` when the caller enables TSM (and other)
+    components in a single combined logging path afterward.
 
     Returns (coredump_since, active, nfs_port, second) or None / 'expect_deploy_fail'.
     """
@@ -105,6 +107,7 @@ def deploy_step(cluster, installer, client, nodes, step, nfs_name, tag):
     nfs_port = step.get("nfs_port", 2049)
     tsm_port = step.get("tsm_port", 36369)
     enable_tsm = step.get("enable_tsm", True)
+    enable_debug = step.get("enable_debug", True)
     expect_enabled = step.get("expect_enabled", enable_tsm)
     check_peers = step.get("check_peers", count >= 2 and enable_tsm)
     placement = step.get("placement", "hosts")
@@ -184,8 +187,11 @@ def deploy_step(cluster, installer, client, nodes, step, nfs_name, tag):
             log.error("[%s] TSM ready check failed for %s", tag, svc)
             return None
 
-    for spec in specs:
-        enable_nfs_debug_logs(client, spec["service_id"], "TSM")
+    if enable_debug:
+        for spec in specs:
+            enable_nfs_debug_logs(client, spec["service_id"], "TSM")
+    else:
+        log.info("[%s] skipping deploy-time TSM debug (caller enables combined logging)", tag)
 
     active = []
     for _ in range(30):
@@ -195,7 +201,7 @@ def deploy_step(cluster, installer, client, nodes, step, nfs_name, tag):
         time.sleep(2)
     if len(active) < count:
         log.error(
-            "[%s] NFS container not seen after debug enable (seen=%s, expected=%s)",
+            "[%s] NFS container not seen after deploy (seen=%s, expected=%s)",
             tag,
             [n.hostname for n in active],
             count,
@@ -230,17 +236,6 @@ def run_io(client, nfs_name, export, mount, nfs_port, server, tag, nfs_version="
     except Exception as exc:
         log.error("[%s] IO failed: %s", tag, exc)
         return 1
-
-
-def check_coredumps(nodes, since, tag):
-    """Return 0 if ok, 1 if a new coredump appeared."""
-    for node in nodes:
-        ts = since.get(node.hostname)
-        if ts and check_coredump_generated(node, COREDUMP_PATH, ts):
-            log.error("[%s] coredump on %s", tag, node.hostname)
-            return 1
-    log.info("[%s] no coredumps", tag)
-    return 0
 
 
 def safe_cleanup(client, mount, nfs_name, export, nodes, steps=None):
@@ -354,6 +349,7 @@ def execute_workflows(
             i,
             name,
         )
+        announce("Do workflow [%s]" % name)
         try:
             runner = handlers.get(name, run_workflow)
             results[name] = runner(
@@ -369,21 +365,7 @@ def execute_workflows(
             log.error("[%s] FAILED: %s", name, exc)
             results[name] = "failed"
 
-    passed = [n for n, s in results.items() if s == "passed"]
-    failed = [n for n, s in results.items() if s == "failed"]
-    skipped = [n for n, s in results.items() if s == "skipped"]
-    log.info(
-        "\n%s\n%s\n%s\n%s\n%s\n%s",
-        "=" * 60,
-        summary_title,
-        "=" * 60,
-        "\n".join(f"  {n:<24} {s.upper()}" for n, s in results.items()),
-        "-" * 60
-        + f"\n  Total: {len(results)}  Passed: {len(passed)}  "
-        f"Failed: {len(failed)}  Skipped: {len(skipped)}",
-        "=" * 60,
-    )
-    return 1 if failed else 0
+    return log_workflow_summary(results, title=summary_title, name_width=24)
 
 
 def run(ceph_cluster, **kw):

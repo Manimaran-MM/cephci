@@ -150,30 +150,37 @@ tests:
   # TSM feature tests
   #---------------------------------------------------------------------------------------------
 
-  # - test:
-  #     name: NFS TSM - Deployment workflows
-  #     module: tsm.test_nfs_tsm_basic.py
-  #     desc: TSM deploy workflows (enable, ports, placement, scale, colocate)
-  #     abort-on-fail: false
-  #     config:
-  #       nfs_version: "4.2"
+  - test:
+      name: NFS TSM - Deployment workflows
+      module: tsm.test_nfs_tsm_basic.py
+      desc: TSM deploy workflows (enable, ports, placement, scale, colocate)
+      abort-on-fail: false
+      config:
+        nfs_version: "4.2"
 
-  # - test:
-  #     name: NFS TSM - Negative workflows
-  #     module: tsm.test_nfs_tsm_negative.py
-  #     desc: Negative TSM (single-daemon reject, disable paths)
-  #     abort-on-fail: false
-  #     config:
-  #       nfs_version: "4.2"
+  - test:
+      name: NFS TSM - Negative workflows
+      module: tsm.test_nfs_tsm_negative.py
+      desc: Negative TSM (single-daemon reject, disable paths)
+      abort-on-fail: false
+      config:
+        nfs_version: "4.2"
 
-  # - test:
-  #     name: NFS TSM - Record validation
-  #     module: tsm.test_nfs_tsm_record_validation.py
-  #     desc: Peer TSM open/lock record counts across hold workflows
-  #     abort-on-fail: false
-  #     config:
-  #       nfs_version: "4.2"
+  - test:
+      name: NFS TSM - Record validation
+      module: tsm.test_nfs_tsm_record_validation.py
+      desc: Peer TSM open/lock record counts across hold workflows
+      abort-on-fail: false
+      config:
+        nfs_version: "4.2"
 
+  - test:
+      name: NFS TSM - Delegation lifecycle - NFSv4.2
+      module: tsm.test_nfs_tsm_delegation.py
+      desc: Peer TSM open/lock/deleg + Ganesha grant/recall/CLOSE across hold lifecycle / none
+      abort-on-fail: false
+      config:
+        nfs_version: "4.2"
   # - test:
   #     name: NFS TSM - Grace IO (open/lock/deleg)
   #     module: tsm.test_nfs_tsm_grace_io.py
@@ -183,73 +190,49 @@ tests:
   #       nfs_version: "4.2"
 
   # - test:
-  #     name: NFS TSM - Delegation lifecycle
-  #     module: tsm.test_nfs_tsm_delegation.py
-  #     desc: Peer TSM open/lock/deleg counters across grant/recall/return/touch/none
+  #     name: NFS TSM - Deployment workflows - NFSv4.1
+  #     module: tsm.test_nfs_tsm_basic.py
+  #     desc: TSM deploy workflows (enable, ports, placement, scale, colocate)
   #     abort-on-fail: false
   #     config:
-  #       nfs_version: "4.2"
-  #       delegation_log_settle_seconds: 90
-  #       delegation_exit_wait_seconds: 120
-  #       delegation_hold_ready_seconds: 8
-  #       delegation_return_wait_seconds: 15
+  #       nfs_version: "4.1"
 
-  - test:
-      name: NFS TSM - Delegation lifecycle - NFSv4.2
-      module: tsm.test_nfs_tsm_delegation.py
-      desc: Peer TSM open/lock/deleg counters across grant/recall/return/touch/none
-      abort-on-fail: false
-      config:
-        nfs_version: "4.2"
-        delegation_log_settle_seconds: 90
-        delegation_exit_wait_seconds: 120
-        delegation_hold_ready_seconds: 8
-        delegation_return_wait_seconds: 15
+  # - test:
+  #     name: NFS TSM - Negative workflows - NFSv4.1
+  #     module: tsm.test_nfs_tsm_negative.py
+  #     desc: Negative TSM (single-daemon reject, disable paths)
+  #     abort-on-fail: false
+  #     config:
+  #       nfs_version: "4.1"
 
-  - test:
-      name: NFS TSM - Deployment workflows - NFSv4.1
-      module: tsm.test_nfs_tsm_basic.py
-      desc: TSM deploy workflows (enable, ports, placement, scale, colocate)
-      abort-on-fail: false
-      config:
-        nfs_version: "4.1"
+  # - test:
+  #     name: NFS TSM - Record validation - NFSv4.1
+  #     module: tsm.test_nfs_tsm_record_validation.py
+  #     desc: Peer TSM open/lock record counts across hold workflows
+  #     abort-on-fail: false
+  #     config:
+  #       nfs_version: "4.1"
 
-  - test:
-      name: NFS TSM - Negative workflows - NFSv4.1
-      module: tsm.test_nfs_tsm_negative.py
-      desc: Negative TSM (single-daemon reject, disable paths)
-      abort-on-fail: false
-      config:
-        nfs_version: "4.1"
+  # - test:
+  #     name: NFS TSM - Deployment workflows - NFSv4.0
+  #     module: tsm.test_nfs_tsm_basic.py
+  #     desc: TSM deploy workflows (enable, ports, placement, scale, colocate)
+  #     abort-on-fail: false
+  #     config:
+  #       nfs_version: "4.0"
 
-  - test:
-      name: NFS TSM - Record validation - NFSv4.1
-      module: tsm.test_nfs_tsm_record_validation.py
-      desc: Peer TSM open/lock record counts across hold workflows
-      abort-on-fail: false
-      config:
-        nfs_version: "4.1"
+  # - test:
+  #     name: NFS TSM - Negative workflows - NFSv4.0
+  #     module: tsm.test_nfs_tsm_negative.py
+  #     desc: Negative TSM (single-daemon reject, disable paths)
+  #     abort-on-fail: false
+  #     config:
+  #       nfs_version: "4.0"
 
-  - test:
-      name: NFS TSM - Deployment workflows - NFSv4.0
-      module: tsm.test_nfs_tsm_basic.py
-      desc: TSM deploy workflows (enable, ports, placement, scale, colocate)
-      abort-on-fail: false
-      config:
-        nfs_version: "4.0"
-
-  - test:
-      name: NFS TSM - Negative workflows - NFSv4.0
-      module: tsm.test_nfs_tsm_negative.py
-      desc: Negative TSM (single-daemon reject, disable paths)
-      abort-on-fail: false
-      config:
-        nfs_version: "4.0"
-
-  - test:
-      name: NFS TSM - Record validation - NFSv4.0
-      module: tsm.test_nfs_tsm_record_validation.py
-      desc: Peer TSM open/lock record counts across hold workflows
-      abort-on-fail: false
-      config:
-        nfs_version: "4.0"
+  # - test:
+  #     name: NFS TSM - Record validation - NFSv4.0
+  #     module: tsm.test_nfs_tsm_record_validation.py
+  #     desc: Peer TSM open/lock record counts across hold workflows
+  #     abort-on-fail: false
+  #     config:
+  #       nfs_version: "4.0"
