@@ -62,6 +62,7 @@ class NfsTsmValidation:
         nfs_nodes,
         expect_enabled=True,
         expected_tsm_port=None,
+        per_node_port=False,
     ):
         """Verify enable_TSM / Tsm_Port in ganesha.conf on each NFS node.
 
@@ -70,13 +71,20 @@ class NfsTsmValidation:
           False — keys present with enable_TSM=false and matching Tsm_Port
           None  — both TSM keys must be absent from NFS_CORE_PARAM
 
+        When ``per_node_port`` is True (or ``expected_tsm_port`` is None and
+        multiple daemons may use distinct ports), each node's ``Tsm_Port`` is
+        taken from that node's ganesha.conf instead of a single global value.
+
         Returns list of per-node results on success, or None on failure.
         """
         log.info("GANESHA.CONF TSM VALIDATION")
         conf_by_host = read_ganesha_conf(nfs_nodes, nfs_name=nfs_name)
         if conf_by_host is None:
             return None
-        expected_port = str(
+        use_per_node = per_node_port or (
+            expected_tsm_port is None and len(nfs_nodes) > 1
+        )
+        global_expected = str(
             self.tsm_port if expected_tsm_port is None else expected_tsm_port
         )
         results = []
@@ -133,12 +141,20 @@ class NfsTsmValidation:
                         enabled,
                     )
                     return None
-                if tsm_port != expected_port:
+                if not has_port or not tsm_port.isdigit():
+                    log.error(
+                        "%s: missing or invalid %s=%r",
+                        node.hostname,
+                        self.tsm_port_key,
+                        tsm_port,
+                    )
+                    return None
+                if not use_per_node and tsm_port != global_expected:
                     log.error(
                         "%s: expected %s=%s, got %r",
                         node.hostname,
                         self.tsm_port_key,
-                        expected_port,
+                        global_expected,
                         tsm_port,
                     )
                     return None
@@ -156,17 +172,25 @@ class NfsTsmValidation:
         return results
 
     def assert_tsm_peer_connections(
-        self, nodes, tsm_port=None, timeout=None, min_peers=1
+        self, nodes, tsm_port=None, conf=None, timeout=None, min_peers=1
     ):
         """Wait until each node has ESTAB TCP sessions to peer IPs on TSM port.
 
+        When ``conf`` is a per-node result list from ``assert_ganesha_tsm_conf``,
+        each node is checked for ESTAB to peer IPs (multi-daemon may use distinct
+        local TSM ports).
+
         Returns 0 on success, 1 on failure.
         """
-        port = int(tsm_port if tsm_port is not None else self.tsm_port)
         timeout = self.timeout if timeout is None else timeout
+        port_by_host = {}
+        if conf:
+            port_by_host = {e["hostname"]: int(e["tsm_port"]) for e in conf}
+        default_port = int(tsm_port if tsm_port is not None else self.tsm_port)
         ips = {node.hostname: node.ip_address for node in nodes}
 
         for node in nodes:
+            local_port = port_by_host.get(node.hostname, default_port)
             peers = [ip for host, ip in ips.items() if host != node.hostname and ip]
             if len(peers) < min_peers:
                 log.error(
@@ -177,21 +201,30 @@ class NfsTsmValidation:
             for _ in WaitUntil(timeout=timeout, interval=self.poll_interval):
                 out, _ = node.exec_command(
                     sudo=True,
-                    cmd=(
-                        f"ss -tnp state established "
-                        f"'( sport = :{port} or dport = :{port} )'"
-                    ),
+                    cmd="ss -tn state established",
                     check_ec=False,
                 )
-                if sum(ip in (out or "") for ip in peers) >= min_peers:
-                    log.info("%s: TSM ESTAB peers ok -> %s", node.hostname, peers)
+                text = out or ""
+                if conf:
+                    ok = sum(ip in text for ip in peers) >= min_peers
+                else:
+                    ok = sum(ip in text for ip in peers) >= min_peers and (
+                        f":{local_port}" in text
+                    )
+                if ok:
+                    log.info(
+                        "%s: TSM ESTAB peers ok (port=%s) -> %s",
+                        node.hostname,
+                        local_port,
+                        peers,
+                    )
                     break
             else:
                 log.error(
-                    "%s: timed out waiting for TSM ESTAB to %s on port %s",
+                    "%s: timed out waiting for TSM ESTAB to %s (local port %s)",
                     node.hostname,
                     peers,
-                    port,
+                    local_port,
                 )
                 return 1
         return 0
@@ -375,6 +408,7 @@ class NfsTsmValidation:
         """
         log.info("ASSERT TSM READY (%s)", nfs_name)
         port = self.tsm_port if tsm_port is None else tsm_port
+        per_node = len(nfs_nodes) > 1
         timeout = self.timeout if timeout is None else timeout
         conf = None
         active = []
@@ -391,13 +425,21 @@ class NfsTsmValidation:
                 nfs_name,
                 active,
                 expect_enabled=expect_enabled,
-                expected_tsm_port=port,
+                expected_tsm_port=port if not per_node else None,
+                per_node_port=per_node,
             )
             if conf is None:
                 log.warning("TSM conf not ready yet")
                 continue
             if expect_enabled:
-                if assert_port_listening(active, port, label="TSM port"):
+                port_ok = 0
+                for entry in conf:
+                    if assert_port_listening(
+                        [entry["node"]], int(entry["tsm_port"]), label="TSM port"
+                    ):
+                        port_ok = 1
+                        break
+                if port_ok:
                     log.warning("TSM port not listening yet")
                     continue
                 if check_boot_logs:
@@ -430,7 +472,7 @@ class NfsTsmValidation:
 
         if expect_enabled and check_peers and conf and len(conf) >= 2:
             if self.assert_tsm_peer_connections(
-                [e["node"] for e in conf], tsm_port=port
+                [e["node"] for e in conf], tsm_port=port, conf=conf
             ):
                 return 1
         return 0

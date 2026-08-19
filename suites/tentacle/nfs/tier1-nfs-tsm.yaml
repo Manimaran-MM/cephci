@@ -1,7 +1,7 @@
 #===============================================================================================
 #---    Test Suite for NFS-Ganesha TSM (Transparent State Migration)   ---
 #===============================================================================================
-# Conf: conf/tentacle/nfs/1admin-7node-3client.yaml
+# Conf: conf/tentacle/nfs/1admin-7node-3client.yaml (3 NFS nodes + >=3 clients)
 #
 # Purpose:
 #   Automate NFS-Ganesha Transparent State Migration (TSM) validation.
@@ -9,7 +9,9 @@
 #   via enable_TSM / Tsm_Port so HA/failover can reclaim state.
 #
 # Requirements:
-#   - ≥2 NFS-capable nodes (node2/node3 in the default conf)
+#   - >=3 NFS nodes in conf for TC-01..09 (count=3, placement hosts)
+#   - >=4 NFS nodes when TC-10 is selected (4-host pool, count=3)
+#   - TC-08/10 reboot the mount server where clients are connected
 #   - Product build that renders enable_TSM / Tsm_Port in ganesha.conf
 #
 # Layout:
@@ -91,7 +93,7 @@ tests:
   #     config:
   #       command: add
   #       id: client.1
-  #       node: node4
+  #       node: node9
   #       install_packages:
   #         - ceph-common
   #         - ceph-fuse
@@ -106,7 +108,7 @@ tests:
   #     config:
   #       command: add
   #       id: client.2
-  #       node: node5
+  #       node: node10
   #       install_packages:
   #         - ceph-common
   #         - ceph-fuse
@@ -121,7 +123,7 @@ tests:
   #     config:
   #       command: add
   #       id: client.3
-  #       node: node6
+  #       node: node11
   #       install_packages:
   #         - ceph-common
   #         - ceph-fuse
@@ -136,7 +138,7 @@ tests:
   #     config:
   #       command: add
   #       id: client.4
-  #       node: node7
+  #       node: node12
   #       install_packages:
   #         - ceph-common
   #         - ceph-fuse
@@ -146,9 +148,9 @@ tests:
   #     module: test_client.py
   #     name: configure client
 
-  #---------------------------------------------------------------------------------------------
-  # TSM feature tests
-  #---------------------------------------------------------------------------------------------
+  # #---------------------------------------------------------------------------------------------
+  # # TSM feature tests
+  # #---------------------------------------------------------------------------------------------
 
   # - test:
   #     name: NFS TSM - Deployment workflows
@@ -174,13 +176,14 @@ tests:
   #     config:
   #       nfs_version: "4.2"
 
-  - test:
-      name: NFS TSM - Delegation lifecycle - NFSv4.2
-      module: tsm.test_nfs_tsm_delegation.py
-      desc: Peer TSM open/lock/deleg + Ganesha grant/recall/CLOSE across hold lifecycle / none
-      abort-on-fail: false
-      config:
-        nfs_version: "4.2"
+  # - test:
+  #     name: NFS TSM - Delegation lifecycle - NFSv4.2
+  #     module: tsm.test_nfs_tsm_delegation.py
+  #     desc: Peer TSM open/lock/deleg + Ganesha grant/recall/CLOSE across hold lifecycle / none
+  #     abort-on-fail: false
+  #     config:
+  #       nfs_version: "4.2"
+
   # - test:
   #     name: NFS TSM - Grace IO (open/lock/deleg)
   #     module: tsm.test_nfs_tsm_grace_io.py
@@ -189,6 +192,15 @@ tests:
   #     config:
   #       nfs_version: "4.2"
 
+  - test:
+      name: NFS TSM - Integration
+      module: tsm.test_nfs_tsm_integration.py
+      desc: TSM integration TC-01..TC-10 (single cluster, 3 exports, 3 clients, deleg off/none/rw)
+      abort-on-fail: false
+      config:
+        nfs_version: "4.2"
+        mds_fail_delay_sec: 5
+        # workflows: ["TC-01", "TC-02"]  # optional subset
   # - test:
   #     name: NFS TSM - Deployment workflows - NFSv4.1
   #     module: tsm.test_nfs_tsm_basic.py
