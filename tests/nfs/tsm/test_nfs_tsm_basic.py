@@ -65,7 +65,16 @@ WORKFLOWS = {
 }
 
 
-def build_spec(nfs_name, nfs_port, tsm_port, enable_tsm, count, hosts, placement):
+def build_spec(
+    nfs_name,
+    nfs_port,
+    tsm_port,
+    enable_tsm,
+    count,
+    hosts,
+    placement,
+    monitoring_port=None,
+):
     """Build NFS orch spec (hosts = pinned list, count = pool with count < len)."""
     if placement == "count":
         if len(hosts) <= count:
@@ -78,15 +87,18 @@ def build_spec(nfs_name, nfs_port, tsm_port, enable_tsm, count, hosts, placement
         place = {"count": count, "hosts": list(hosts)}
     else:
         place = {"count": count, "hosts": hosts[:count]}
+    spec_body = {
+        "port": int(nfs_port),
+        "enable_tsm": bool(enable_tsm),
+        "tsm_port": int(tsm_port),
+    }
+    if monitoring_port is not None:
+        spec_body["monitoring_port"] = int(monitoring_port)
     return {
         "service_type": "nfs",
         "service_id": nfs_name,
         "placement": place,
-        "spec": {
-            "port": int(nfs_port),
-            "enable_tsm": bool(enable_tsm),
-            "tsm_port": int(tsm_port),
-        },
+        "spec": spec_body,
     }
 
 
@@ -106,6 +118,7 @@ def deploy_step(cluster, installer, client, nodes, step, nfs_name, tag):
     count = step.get("nfs_count", 2)
     nfs_port = step.get("nfs_port", 2049)
     tsm_port = step.get("tsm_port", 36369)
+    monitoring_port = step.get("monitoring_port")
     enable_tsm = step.get("enable_tsm", True)
     enable_debug = step.get("enable_debug", True)
     expect_enabled = step.get("expect_enabled", enable_tsm)
@@ -118,7 +131,16 @@ def deploy_step(cluster, installer, client, nodes, step, nfs_name, tag):
     log_since, coredump_since = get_node_time(pool)
 
     specs = [
-        build_spec(nfs_name, nfs_port, tsm_port, enable_tsm, count, hosts, placement)
+        build_spec(
+            nfs_name,
+            nfs_port,
+            tsm_port,
+            enable_tsm,
+            count,
+            hosts,
+            placement,
+            monitoring_port=monitoring_port,
+        )
     ]
     if specs[0] is None:
         return None
@@ -131,6 +153,7 @@ def deploy_step(cluster, installer, client, nodes, step, nfs_name, tag):
             count,
             hosts[:count],
             "hosts",
+            monitoring_port=second.get("monitoring_port", monitoring_port),
         )
         if second_spec is None:
             return None
