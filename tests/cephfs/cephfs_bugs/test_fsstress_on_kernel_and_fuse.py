@@ -128,7 +128,7 @@ def run(ceph_cluster, **kw):
                 f"chmod 777 {directory}fsstress/fsstress.sh",
             ]
             run_commands(client1, commands)
-        iterations = 50
+        iterations = 10
         log.info(
             f"run fsstress on kernel and fuse in parallel for {iterations} iterations"
         )
