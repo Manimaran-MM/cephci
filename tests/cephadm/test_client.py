@@ -142,7 +142,10 @@ def add(cls, config: Dict) -> None:
                         cmd=f"{enable_cmd}{manifest.repo_id}",
                     )
 
-            if rhcs_version != "default" and not _manifest_section:
+            # if rhcs_version != "default" and not _manifest_section:
+            if rhcs_version != "default" and (
+                not _manifest_section or (manifest_obj and manifest_obj.product == "redhat")
+            ):
                 try:
                     # Disabling all the repos and enabling the ones we need to install the ceph client
                     for cmd in disable_all:
