@@ -1,7 +1,8 @@
 #===============================================================================================
 #---    Test Suite for NFS-Ganesha TSM (Transparent State Migration)   ---
 #===============================================================================================
-# Conf: conf/tentacle/nfs/1admin-7node-3client.yaml (3 NFS nodes + >=3 clients)
+# Conf: conf/tentacle/nfs/1admin-12node-4client.yaml (>=4 NFS + >=3 clients)
+#   or baremetal with >=4 NFS roles / equivalent
 #
 # Purpose:
 #   Automate NFS-Ganesha Transparent State Migration (TSM) validation.
@@ -11,6 +12,8 @@
 # Requirements:
 #   - >=3 NFS nodes in conf for TC-01..09 (count=3, placement hosts)
 #   - >=4 NFS nodes when TC-10 is selected (4-host pool, count=3)
+#   - Grace IO conflict (test_nfs_tsm_grace_io.py): >=4 NFS + >=3 clients
+#     (spare NFS + spare client open-hold + iptables -I for ~90s grace)
 #   - TC-08/10 reboot the mount server where clients are connected
 #   - Product build that renders enable_TSM / Tsm_Port in ganesha.conf
 #
@@ -19,7 +22,7 @@
 #   2. Basic TSM enablement (conf + listen + IO)
 #   3. Peer sync (Ceph_Nodes, ESTAB, recovery log markers)
 #   4. Record validation (steady-state open/lock counters)
-#   5. Grace IO (OPEN/LOCK/DELEG during grace — test_nfs_tsm_grace_io.py)
+#   5. Grace IO open-conflict during extended grace — test_nfs_tsm_grace_io.py
 #   6. TSM + delegation lifecycle (open/lock/deleg peer summary — test_nfs_tsm_delegation.py)
 #
 # Negative scenarios live in tier1-nfs-tsm-negative.yaml
@@ -159,6 +162,7 @@ tests:
   #     abort-on-fail: false
   #     config:
   #       nfs_version: "4.2"
+  #     comments: "colocation - IBMCEPH-17473"
 
   # - test:
   #     name: NFS TSM - Negative workflows
@@ -184,23 +188,25 @@ tests:
   #     config:
   #       nfs_version: "4.2"
 
-  # - test:
-  #     name: NFS TSM - Grace IO (open/lock/deleg)
-  #     module: tsm.test_nfs_tsm_grace_io.py
-  #     desc: TSM grace reclaim for open/lock/deleg
-  #     abort-on-fail: false
-  #     config:
-  #       nfs_version: "4.2"
-
   - test:
-      name: NFS TSM - Integration
-      module: tsm.test_nfs_tsm_integration.py
-      desc: TSM integration TC-01..TC-10 (single cluster, 3 exports, 3 clients, deleg off/none/rw)
+      name: NFS TSM - Grace IO (open conflict)
+      module: tsm.test_nfs_tsm_grace_io.py
+      desc: TSM grace C01-C03 (C1 WRITE_ONLY; C2 RO/WO/RW each in own ~90s window)
       abort-on-fail: false
       config:
         nfs_version: "4.2"
-        mds_fail_delay_sec: 5
-        # workflows: ["TC-01", "TC-02"]  # optional subset
+        nfs_count: 4
+        # workflows: ["TC-TSM-G-C01", "TC-TSM-G-C02"]
+
+  # - test:
+  #     name: NFS TSM - Integration
+  #     module: tsm.test_nfs_tsm_integration.py
+  #     desc: TSM integration TC-01..TC-10 (single cluster, 3 exports, 3 clients, deleg off/none/rw)
+  #     abort-on-fail: false
+  #     config:
+  #       nfs_version: "4.2"
+  #       mds_fail_delay_sec: 5
+  #       # workflows: ["TC-01", "TC-02"]  # optional subset
   # - test:
   #     name: NFS TSM - Deployment workflows - NFSv4.1
   #     module: tsm.test_nfs_tsm_basic.py

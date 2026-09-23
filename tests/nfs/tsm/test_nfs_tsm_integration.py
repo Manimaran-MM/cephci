@@ -43,7 +43,7 @@ from tests.nfs.tsm.test_nfs_tsm_basic import (
     nodes_running_nfs,
     safe_cleanup,
 )
-from tests.nfs.tsm.test_nfs_tsm_grace_io import GraceCtx, enter_grace
+from tests.nfs.lib.tsm.grace_hold import GraceCtx, enter_grace
 from utility.log import Log
 
 log = Log(__name__)

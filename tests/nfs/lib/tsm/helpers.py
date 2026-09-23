@@ -18,23 +18,95 @@ log = Log(__name__)
 SUMMARY_RE = re.compile(
     r"Tsm record summary total=(\d+) open=(\d+) lock=(\d+) deleg=(\d+)", re.I
 )
+# "Node id: N" / "Nodeid: N" both appear in tsm_print_node_state.
+NODE_SUMMARY_RE = re.compile(
+    r"Node\s*id:\s*(-?\d+)\s+Tsm record summary "
+    r"total=(\d+) open=(\d+) lock=(\d+) deleg=(\d+)",
+    re.I,
+)
+GANESHA_ID_RE = re.compile(r"Ganesha ID:\s*(\d+)", re.I)
 POLL_TIMEOUT = 90
 POLL_INTERVAL = 3
+COREDUMP_PATH = "/var/lib/systemd/coredump"
 
 
-def peer_summary(peers, nfs_name, since=None):
-    """Last peer TSM summary from ``podman logs``."""
+def _podman_logs(node, nfs_name, since=None):
+    """Return (cid, log_text). cid is None if the NFS container is missing."""
+    cid = get_nfs_container_id(node, nfs_name=nfs_name)
+    if not cid:
+        return None, ""
+    node_since = since.get(node.hostname) if isinstance(since, dict) else since
+    since_arg = f' --since "{node_since}"' if node_since else ""
+    out, _ = node.exec_command(
+        sudo=True, cmd=f"podman logs{since_arg} {cid} 2>&1", check_ec=False
+    )
+    return cid, out or ""
+
+
+def _bump_counts(counts, total, open_c, lock_c, deleg_c):
+    counts["seen"] = True
+    counts["total"] = max(counts["total"], int(total))
+    counts["open"] = max(counts["open"], int(open_c))
+    counts["lock"] = max(counts["lock"], int(lock_c))
+    counts["deleg"] = max(counts["deleg"], int(deleg_c))
+
+
+def get_host_tsm_node_id(node, nfs_name):
+    """Return NFS host's TSM id from ``Ganesha ID: N`` in podman logs."""
+    _, out = _podman_logs(node, nfs_name)
+    node_id = None
+    for ln in out.splitlines():
+        m = GANESHA_ID_RE.search(ln)
+        if m:
+            node_id = int(m.group(1))
+    if node_id is not None:
+        log.info("TSM Node-id on %s = %s (from Ganesha ID)", node.hostname, node_id)
+    else:
+        log.warning(
+            "TSM Node-id not found on %s (no 'Ganesha ID: N' in podman logs)",
+            node.hostname,
+        )
+    return node_id
+
+
+def collect_tsm_node_ids(nodes, nfs_name):
+    """Map hostname → TSM Node-id for each NFS host (stable after deploy)."""
+    mapping = {}
+    for node in nodes:
+        nid = get_host_tsm_node_id(node, nfs_name)
+        if nid is not None:
+            mapping[node.hostname] = nid
+    log.info("TSM Node-id map (post-deploy): %s", mapping)
+    return mapping
+
+
+def peer_summary(peers, nfs_name, since=None, node_id=None):
+    """Last peer TSM summary from ``podman logs``.
+
+    If ``node_id`` is set, only match that Node-id record.
+    """
     counts = {"total": 0, "open": 0, "lock": 0, "deleg": 0, "seen": False}
     for node in peers:
-        cid = get_nfs_container_id(node, nfs_name=nfs_name)
-        if not cid:
+        _, out = _podman_logs(node, nfs_name, since=since)
+        lines = [ln for ln in out.splitlines() if SUMMARY_RE.search(ln)]
+
+        if node_id is not None:
+            matched, last_m = [], None
+            for ln in lines:
+                nm = NODE_SUMMARY_RE.search(ln)
+                if nm and int(nm.group(1)) == int(node_id):
+                    matched.append(ln)
+                    last_m = nm
+            log.info(
+                "TSM record summary on %s (Node-id %s):\n%s",
+                node.hostname,
+                node_id,
+                "\n".join(matched[-3:]) if matched else "<none>",
+            )
+            if last_m:
+                _bump_counts(counts, *last_m.group(2, 3, 4, 5))
             continue
-        node_since = since.get(node.hostname) if isinstance(since, dict) else since
-        since_arg = f' --since "{node_since}"' if node_since else ""
-        out, _ = node.exec_command(
-            sudo=True, cmd=f"podman logs{since_arg} {cid} 2>&1", check_ec=False
-        )
-        lines = [ln for ln in (out or "").splitlines() if SUMMARY_RE.search(ln)]
+
         log.info(
             "TSM record summary on %s:\n%s",
             node.hostname,
@@ -43,13 +115,8 @@ def peer_summary(peers, nfs_name, since=None):
         if not lines:
             continue
         m = SUMMARY_RE.search(lines[-1])
-        if not m:
-            continue
-        counts["seen"] = True
-        counts["total"] = max(counts["total"], int(m.group(1)))
-        counts["open"] = max(counts["open"], int(m.group(2)))
-        counts["lock"] = max(counts["lock"], int(m.group(3)))
-        counts["deleg"] = max(counts["deleg"], int(m.group(4)))
+        if m:
+            _bump_counts(counts, *m.group(1, 2, 3, 4))
     return counts
 
 
@@ -64,52 +131,38 @@ def wait_peer_counts(
     timeout=POLL_TIMEOUT,
     interval=POLL_INTERVAL,
     raise_on_timeout=False,
+    node_id=None,
 ):
     """Poll until peer open/lock/(optional deleg) match.
 
-    Return counts on success. On timeout: raise OperationFailedError if
-    ``raise_on_timeout``, else return None.
+    Return counts on success. On timeout: raise if ``raise_on_timeout``, else None.
     """
     deadline = time.time() + timeout
     last = None
+    want = fmt_tsm(expect_open, expect_lock, expect_deleg)
+    nid_s = f" Node-id={node_id}" if node_id is not None else ""
+
     while time.time() < deadline:
-        last = peer_summary(peers, nfs_name, since=since)
+        last = peer_summary(peers, nfs_name, since=since, node_id=node_id)
         if (
             last.get("seen")
             and last["open"] == expect_open
             and last["lock"] == expect_lock
             and (expect_deleg is None or last["deleg"] == expect_deleg)
         ):
-            if expect_deleg is None:
-                log.info(
-                    "[%s] peer summary ok (open=%s lock=%s)",
-                    label,
-                    expect_open,
-                    expect_lock,
-                )
-            else:
-                log.info(
-                    "[%s] peer summary ok (open=%s lock=%s deleg=%s)",
-                    label,
-                    expect_open,
-                    expect_lock,
-                    expect_deleg,
-                )
+            log.info("[%s] peer summary ok (%s)%s", label, want, nid_s)
             return last
         time.sleep(interval)
+
     log.error(
-        "[%s] peer summary timeout: want open=%s lock=%s deleg=%s last=%s",
+        "[%s] peer summary timeout: want %s node_id=%s last=%s",
         label,
-        expect_open,
-        expect_lock,
-        expect_deleg,
+        want,
+        node_id,
         last,
     )
     if raise_on_timeout:
-        raise OperationFailedError(
-            "[%s] TSM timeout want %s"
-            % (label, fmt_tsm(expect_open, expect_lock, expect_deleg))
-        )
+        raise OperationFailedError("[%s] TSM timeout want %s" % (label, want))
     return None
 
 
@@ -129,11 +182,9 @@ def start_bg(client, cmd):
 
 
 def kill_holds(holds):
-    for client, pid in holds:
+    """Best-effort kill of (client, pid) holds. Safe if holds is empty/None."""
+    for client, pid in holds or []:
         NfsFcntlLock.kill_pid(client, pid)
-
-
-COREDUMP_PATH = "/var/lib/systemd/coredump"
 
 
 def check_coredumps(nodes, since, tag):
@@ -223,7 +274,8 @@ def run_step(
 ):
     """Banner + run fn; record passed/failed in results. Return True on pass.
 
-    When ``coredump_nodes`` is set, also fail the step if a new coredump appears.
+    Exceptions from ``fn`` are caught and recorded as failed (no re-raise).
+    Optional coredump check after a successful ``fn``.
     """
     log.info(
         "\n==============================\n"
