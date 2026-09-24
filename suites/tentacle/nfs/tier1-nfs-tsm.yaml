@@ -191,12 +191,12 @@ tests:
   - test:
       name: NFS TSM - Grace IO (open conflict)
       module: tsm.test_nfs_tsm_grace_io.py
-      desc: TSM grace C01-C03 (C1 WRITE_ONLY; C2 RO/WO/RW each in own ~90s window)
+      desc: TSM grace C01-C09 (C1 WO/RO/RW; C2 RO/WO/RW each in own ~90s window)
       abort-on-fail: false
       config:
         nfs_version: "4.2"
         nfs_count: 4
-        # workflows: ["TC-TSM-G-C01", "TC-TSM-G-C02"]
+        # workflows: ["TC-TSM-G-C04", "TC-TSM-G-C05", "TC-TSM-G-C06", "TC-TSM-G-C07", "TC-TSM-G-C08", "TC-TSM-G-C09"]
 
   # - test:
   #     name: NFS TSM - Integration
