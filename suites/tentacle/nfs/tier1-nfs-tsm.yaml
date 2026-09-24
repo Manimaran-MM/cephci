@@ -191,12 +191,20 @@ tests:
   - test:
       name: NFS TSM - Grace IO (open conflict)
       module: tsm.test_nfs_tsm_grace_io.py
-      desc: TSM grace C01-C15 (open/lock conflicts + C13-C15 on delegations=rw export)
+      desc: TSM grace C01-C22 (open/lock/deleg + pre-grace sticky C16-C22)
       abort-on-fail: false
       config:
         nfs_version: "4.2"
         nfs_count: 4
-        # workflows: ["TC-TSM-G-C13"]
+        workflows: ["TC-TSM-G-C21", "TC-TSM-G-C22"]
+      comments: |
+        TC-TSM-G-C16 - IBMCEPH-19165, IBMCEPH-18586
+        TC-TSM-G-C17 - IBMCEPH-19165, IBMCEPH-18586
+        TC-TSM-G-C18 - IBMCEPH-19165, IBMCEPH-18586
+        TC-TSM-G-C19 - IBMCEPH-19165, IBMCEPH-18586
+        TC-TSM-G-C20 - IBMCEPH-19165, IBMCEPH-18586
+        TC-TSM-G-C21 - IBMCEPH-19165, IBMCEPH-18586
+        TC-TSM-G-C22 - IBMCEPH-19165, IBMCEPH-18586
 
   # - test:
   #     name: NFS TSM - Integration

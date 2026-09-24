@@ -13,6 +13,18 @@ C12: C1 RO+nrlock; C2 RW blocked → after grace open ok; nwlock denied then nrl
 C13: deleg export type5; C1 WO+nwlock; C2 RW blocked → recall; nrlock+nwlock denied.
 C14: deleg export type4; C1 RO+nrlock; C2 RW blocked → nwlock denied then nrlock ok.
 C15: deleg export type4; C1 RO+nrlock; C2 RO+nrlock both succeed (deleg 1→2).
+C16: pre-grace WO+nwlock on wf0; during grace C1 WO + C2 RO conflict on wf1; after open ok.
+C17: pre-grace WO+nwlock on wf0; during grace C1 RO + C2 RO succeed on wf1 (compatible).
+C18: pre-grace WO+nwlock on wf0; during grace C1 WO + C2 RW blocked on wf1;
+     after open ok; nrlock+nwlock denied (pre-grace lock preserved).
+C19: pre-grace RO+nrlock on wf0; during grace C1 WO + C2 RW blocked on wf1;
+     after open ok; nwlock denied then nrlock success.
+C20: pre-grace WO+nwlock on wf1; during grace C2 RO blocked on same file;
+     after open ok; nrlock+nwlock denied (reclaim vs pre-grace open).
+C21: deleg export; pre-grace WO+nwlock on wf0; during C1 WO+nwlock + C2 RW on wf1;
+     after recall; nrlock+nwlock denied (sticky deleg preserved).
+C22: pre-grace C1 WO+nwlock on wf0 + C2 RO+nrlock on wf2; during C1 WO + C2 RO
+     blocked on wf1; after open ok (multi-client floor preserved).
 """
 
 import re
@@ -55,8 +67,10 @@ log = Log(__name__)
 TSM_PORT = 36369
 DEFAULT_NFS_COUNT = 4
 MIN_CLIENTS = 3  # C1 + C2 + spare hold client
-SPARE_FILE_IDX = 0
-WF_FILE_IDX = 1
+SPARE_FILE_IDX = 0  # spare mount: spare0.txt
+PRE_FILE_IDX = 0  # primary wf mount: wf0.txt (pre-grace sticky records)
+WF_FILE_IDX = 1  # primary wf mount: wf1.txt (grace conflict)
+PRE_C2_FILE_IDX = 2  # C22: C2 pre-grace sticky on wf2.txt
 
 WO, RO, RW = "WRITE_ONLY", "READ_ONLY", "READ_WRITE"
 SHARE_ACCESS = {RO: 1, WO: 2, RW: 3}
@@ -200,6 +214,119 @@ WORKFLOWS = {
         "c2_expect": "success",
         "c2_lock_during": "nrlock",
     },
+    # Pre-grace sticky records on wf0; C01-style conflict on wf1 during/after grace
+    "TC-TSM-G-C16": {
+        "desc": (
+            "pre-grace C1 WO+nwlock on wf0; during grace C1 WO + C2 RO blocked on wf1; "
+            "after grace open ok; pre-grace lock preserved"
+        ),
+        "pre_grace": {
+            "c1_mode": WO,
+            "c1_lock": "nwlock",
+            "file_idx": PRE_FILE_IDX,
+        },
+        "c1_mode": WO,
+        "c2_mode": RO,
+        "c2_expect": "blocked",
+    },
+    "TC-TSM-G-C17": {
+        "desc": (
+            "pre-grace C1 WO+nwlock on wf0; during grace C1 RO + C2 RO succeed on wf1; "
+            "pre-grace lock preserved"
+        ),
+        "pre_grace": {
+            "c1_mode": WO,
+            "c1_lock": "nwlock",
+            "file_idx": PRE_FILE_IDX,
+        },
+        "c1_mode": RO,
+        "c2_mode": RO,
+        "c2_expect": "success",
+    },
+    "TC-TSM-G-C18": {
+        "desc": (
+            "pre-grace C1 WO+nwlock on wf0; during grace C1 WO + C2 RW blocked on wf1; "
+            "after grace open ok; nrlock then nwlock denied; pre-grace lock preserved"
+        ),
+        "pre_grace": {
+            "c1_mode": WO,
+            "c1_lock": "nwlock",
+            "file_idx": PRE_FILE_IDX,
+        },
+        "c1_mode": WO,
+        "c2_mode": RW,
+        "c2_expect": "blocked",
+        "c2_locks": [("nrlock", "denied"), ("nwlock", "denied")],
+    },
+    "TC-TSM-G-C19": {
+        "desc": (
+            "pre-grace C1 RO+nrlock on wf0; during grace C1 WO + C2 RW blocked on wf1; "
+            "after grace open ok; nwlock denied then nrlock success"
+        ),
+        "pre_grace": {
+            "c1_mode": RO,
+            "c1_lock": "nrlock",
+            "file_idx": PRE_FILE_IDX,
+        },
+        "c1_mode": WO,
+        "c2_mode": RW,
+        "c2_expect": "blocked",
+        "c2_locks": [("nwlock", "denied"), ("nrlock", "success")],
+    },
+    "TC-TSM-G-C20": {
+        "desc": (
+            "pre-grace C1 WO+nwlock on wf1; during grace C2 RO blocked on same file; "
+            "after grace open ok; nrlock then nwlock denied"
+        ),
+        "pre_grace": {
+            "c1_mode": WO,
+            "c1_lock": "nwlock",
+            "file_idx": WF_FILE_IDX,
+        },
+        "skip_c1_during": True,  # C1 already holds wf1 from pre-grace
+        "c1_mode": WO,  # existing_sa for conflict logs
+        "c2_mode": RO,
+        "c2_expect": "blocked",
+        "c2_locks": [("nrlock", "denied"), ("nwlock", "denied")],
+    },
+    "TC-TSM-G-C21": {
+        "desc": (
+            "deleg: pre-grace C1 WO+nwlock on wf0; during grace C1 WO+nwlock + C2 RW "
+            "blocked on wf1; after recall; nrlock then nwlock denied"
+        ),
+        "use_deleg_export": True,
+        "pre_grace": {
+            "c1_mode": WO,
+            "c1_lock": "nwlock",
+            "file_idx": PRE_FILE_IDX,
+        },
+        "c1_mode": WO,
+        "c1_lock": "nwlock",
+        "c2_mode": RW,
+        "c2_expect": "blocked",
+        "after_open_lock_delta": 1,
+        "after_open_deleg_delta": -1,
+        "c2_locks": [("nrlock", "denied"), ("nwlock", "denied")],
+    },
+    "TC-TSM-G-C22": {
+        "desc": (
+            "pre-grace C1 WO+nwlock on wf0 + C2 RO+nrlock on wf2; during grace "
+            "C1 WO + C2 RO blocked on wf1; after grace open ok; multi-client floor"
+        ),
+        "pre_grace": {
+            "c1_mode": WO,
+            "c1_lock": "nwlock",
+            "file_idx": PRE_FILE_IDX,
+        },
+        "pre_grace_c2": {
+            "c2_mode": RO,
+            "c2_lock": "nrlock",
+            "file_idx": PRE_C2_FILE_IDX,
+        },
+        "c1_mode": WO,
+        "c2_mode": RO,
+        "c2_expect": "blocked",
+    },
 }
 
 
@@ -211,13 +338,17 @@ def _spare_file_base(mount):
     return f"{mount.rstrip('/')}/spare"
 
 
-def _seed_wf_file(client, mount):
-    path = f"{_file_base(mount)}{WF_FILE_IDX}.txt"
-    client.exec_command(
-        sudo=True,
-        cmd=f"bash -c 'echo seed > {path}; chmod 666 {path}'",
-        check_ec=False,
-    )
+def _seed_wf_file(client, mount, indices=None):
+    """Create wf{i}.txt for each index (needed for O_RDONLY/O_WRONLY/O_RDWR)."""
+    if indices is None:
+        indices = [WF_FILE_IDX]
+    for i in indices:
+        path = f"{_file_base(mount)}{i}.txt"
+        client.exec_command(
+            sudo=True,
+            cmd=f"bash -c 'echo seed > {path}; chmod 666 {path}'",
+            check_ec=False,
+        )
 
 
 def _workflow_peers(ctx):
@@ -228,16 +359,21 @@ def _workflow_peers(ctx):
     return [n for n in peers if n.hostname != ctx.spare_node.hostname]
 
 
-def _close_and_stop(sess, index=None, unlock=False):
-    """Close held index (optional unlock first), then stop the session."""
+def _close_and_stop(sess, indexes=None, unlock_indexes=None):
+    """Close held indexes (optional unlock first), then stop the session."""
     if not sess:
         return
+    if indexes is None:
+        indexes = []
+    elif isinstance(indexes, int):
+        indexes = [indexes]
+    unlock_indexes = set(unlock_indexes or [])
     try:
-        if index is not None:
-            if unlock:
-                sess.send(f"unlock {index}")
+        for idx in indexes:
+            if idx in unlock_indexes:
+                sess.send(f"unlock {idx}")
                 time.sleep(1)
-            sess.send(f"close {index}")
+            sess.send(f"close {idx}")
             time.sleep(1)
         sess.stop()
     except Exception as exc:
@@ -528,16 +664,19 @@ def _run_c2_locks(ctx, c2_sess, peers, node_id, tag, locks):
 
 
 def tc_conflict_generic(ctx, spec, nfs_version="4.2"):
-    """One TC: C1 open[/lock] during grace; C2 open success|blocked; optional c2 lock."""
+    """One TC: optional pre-grace records; C1/C2 during grace; after-grace as needed."""
     tag = spec["id"]
     use_deleg = bool(spec.get("use_deleg_export"))
+    pre_grace = spec.get("pre_grace")  # {c1_mode, c1_lock?, file_idx}
+    pre_grace_c2 = spec.get("pre_grace_c2")  # {c2_mode, c2_lock?, file_idx}
+    skip_c1_during = bool(spec.get("skip_c1_during"))
     c1_mode = spec.get("c1_mode", WO)
-    c1_lock = spec.get("c1_lock")  # e.g. nwlock
+    c1_lock = spec.get("c1_lock")  # lock during grace (C10–C15); not pre-grace
     c2_mode = spec["c2_mode"]
     c2_expect = spec.get("c2_expect", "blocked")
-    c2_lock_during = spec.get("c2_lock_during")  # lock during grace (with open success)
+    c2_lock_during = spec.get("c2_lock_during")
     c2_locks = _normalize_c2_locks(spec)
-    after_open_deleg_delta = spec.get("after_open_deleg_delta")  # None | int
+    after_open_deleg_delta = spec.get("after_open_deleg_delta")
     after_open_lock_delta = spec.get("after_open_lock_delta", 0)
     c1, c2 = ctx.client_a, ctx.client_b
     if not c2 or ctx.server_node_id is None:
@@ -553,8 +692,26 @@ def tc_conflict_generic(ctx, spec, nfs_version="4.2"):
     else:
         mount = ctx.mount
 
-    _seed_wf_file(c1, mount)
-    # Seed write may briefly grant write-deleg; let it return before grace opens.
+    seed_idxs = [WF_FILE_IDX]
+    pre_idx = None
+    pre_lock = None
+    pre_mode = None
+    if pre_grace:
+        pre_idx = int(pre_grace.get("file_idx", PRE_FILE_IDX))
+        pre_lock = pre_grace.get("c1_lock")
+        pre_mode = pre_grace.get("c1_mode", WO)
+        if pre_idx not in seed_idxs:
+            seed_idxs.append(pre_idx)
+    pre_c2_idx = None
+    pre_c2_lock = None
+    pre_c2_mode = None
+    if pre_grace_c2:
+        pre_c2_idx = int(pre_grace_c2.get("file_idx", PRE_C2_FILE_IDX))
+        pre_c2_lock = pre_grace_c2.get("c2_lock")
+        pre_c2_mode = pre_grace_c2.get("c2_mode", RO)
+        if pre_c2_idx not in seed_idxs:
+            seed_idxs.append(pre_c2_idx)
+    _seed_wf_file(c1, mount, indices=seed_idxs)
     time.sleep(3 if use_deleg else 1)
     if _mount_spare(ctx, nfs_version):
         return 1
@@ -567,68 +724,159 @@ def tc_conflict_generic(ctx, spec, nfs_version="4.2"):
     c1_sess = None
     c2_sess = None
     c2_held_lock = False
+    c1_close_idxs = [WF_FILE_IDX]
+    c1_unlock_idxs = []
+    c2_close_idxs = [WF_FILE_IDX]
+    c2_unlock_idxs = []
+    # Share-access for conflict logs: pre-grace open when C1 skips during-grace open
+    conflict_existing_mode = pre_mode if (skip_c1_during and pre_mode) else c1_mode
     try:
+        peers = _workflow_peers(ctx)
+        if not peers:
+            log.error("[%s] need ≥1 peer for TSM summary", tag)
+            return 1
+        node_id = ctx.server_node_id
+        base = _file_base(mount)
+
+        # --- Optional pre-grace sticky records (C1) ---
+        if pre_grace:
+            c1_sess = InteractiveSession(c1, base, tag="c1")
+            if not c1_sess.start():
+                return 1
+            if pre_idx not in c1_close_idxs:
+                c1_close_idxs.insert(0, pre_idx)
+            label = f"{tag} C1 pre-grace {pre_mode}" + (
+                f"+{pre_lock}" if pre_lock else ""
+            )
+            announce(f"[{label}] open expect=success (before grace)")
+            baseline = peer_summary(peers, ctx.nfs_name, node_id=node_id)
+            open_since, _ = get_node_time(peers)
+            if c1_sess.open_file(pre_idx, pre_mode, timeout=30) != "success":
+                log.error("[%s] pre-grace open failed", label)
+                return 1
+            if pre_lock:
+                announce(f"[{label}] {pre_lock} expect=success")
+                if c1_sess.lock_file(pre_idx, pre_lock, timeout=15) != "success":
+                    log.error("[%s] pre-grace %s failed", label, pre_lock)
+                    return 1
+                c1_unlock_idxs.append(pre_idx)
+                if use_deleg:
+                    # Write-deleg: lock stays client-local until recall
+                    if _tsm_expect(
+                        ctx,
+                        baseline,
+                        label,
+                        open_since,
+                        True,
+                        open_delta=1,
+                        lock_delta=0,
+                        deleg_delta=1,
+                    ):
+                        return 1
+                elif _tsm_expect(
+                    ctx, baseline, label, open_since, True, open_delta=1, lock_delta=1
+                ):
+                    return 1
+            elif _tsm_expect(ctx, baseline, label, open_since, True, open_delta=1):
+                return 1
+            log.info("[%s] → pre-grace records ok (held through grace)", label)
+
+        # --- Optional pre-grace sticky records (C2 / multi-client) ---
+        if pre_grace_c2:
+            c2_sess = InteractiveSession(c2, base, tag="c2pre")
+            if not c2_sess.start():
+                return 1
+            if pre_c2_idx not in c2_close_idxs:
+                c2_close_idxs.insert(0, pre_c2_idx)
+            label = f"{tag} C2 pre-grace {pre_c2_mode}" + (
+                f"+{pre_c2_lock}" if pre_c2_lock else ""
+            )
+            announce(f"[{label}] open expect=success (before grace)")
+            baseline = peer_summary(peers, ctx.nfs_name, node_id=node_id)
+            open_since, _ = get_node_time(peers)
+            if c2_sess.open_file(pre_c2_idx, pre_c2_mode, timeout=30) != "success":
+                log.error("[%s] C2 pre-grace open failed", label)
+                return 1
+            if pre_c2_lock:
+                announce(f"[{label}] {pre_c2_lock} expect=success")
+                if c2_sess.lock_file(pre_c2_idx, pre_c2_lock, timeout=15) != "success":
+                    log.error("[%s] C2 pre-grace %s failed", label, pre_c2_lock)
+                    return 1
+                c2_unlock_idxs.append(pre_c2_idx)
+                c2_held_lock = True
+                if _tsm_expect(
+                    ctx, baseline, label, open_since, True, open_delta=1, lock_delta=1
+                ):
+                    return 1
+            elif _tsm_expect(ctx, baseline, label, open_since, True, open_delta=1):
+                return 1
+            log.info("[%s] → C2 pre-grace records ok (held through grace)", label)
+
         announce(f"[{tag}] hold cluster grace (spare + iptables -I)")
         rc, grace_since = hold_cluster_grace(ctx, spare_sess)
         if rc:
             return 1
 
-        peers = _workflow_peers(ctx)
-        if not peers:
-            log.error("[%s] need ≥1 peer for TSM summary", tag)
-            return 1
-
-        base = _file_base(mount)
-        c1_sess = InteractiveSession(c1, base, tag="c1")
-        if not c1_sess.start():
-            return 1
-
-        node_id = ctx.server_node_id
-
-        # --- C1 during grace ---
-        label = f"{tag} C1 during {c1_mode}" + (f"+{c1_lock}" if c1_lock else "")
-        announce(f"[{label}] open expect=success")
-        baseline = peer_summary(peers, ctx.nfs_name, node_id=node_id)
-        open_since, _ = get_node_time(peers)
-        if c1_sess.open_file(WF_FILE_IDX, c1_mode, timeout=30) != "success":
-            log.error("[%s] C1 open failed", label)
-            return 1
-        if c1_lock:
-            announce(f"[{label}] {c1_lock} expect=success")
-            if c1_sess.lock_file(WF_FILE_IDX, c1_lock, timeout=15) != "success":
-                log.error("[%s] C1 %s failed", label, c1_lock)
+        if not c1_sess:
+            c1_sess = InteractiveSession(c1, base, tag="c1")
+            if not c1_sess.start():
                 return 1
-            # Deleg profile: open+1 lock+0 deleg+1 (lock stays client-local)
-            if use_deleg:
-                if _tsm_expect(
-                    ctx,
-                    baseline,
-                    label,
-                    open_since,
-                    True,
-                    open_delta=1,
-                    lock_delta=0,
-                    deleg_delta=1,
+
+        # --- C1 during grace (skipped when pre-grace already holds conflict file) ---
+        if not skip_c1_during:
+            label = f"{tag} C1 during {c1_mode}" + (f"+{c1_lock}" if c1_lock else "")
+            announce(f"[{label}] open expect=success")
+            baseline = peer_summary(peers, ctx.nfs_name, node_id=node_id)
+            open_since, _ = get_node_time(peers)
+            if c1_sess.open_file(WF_FILE_IDX, c1_mode, timeout=30) != "success":
+                log.error("[%s] C1 open failed", label)
+                return 1
+            if c1_lock:
+                announce(f"[{label}] {c1_lock} expect=success")
+                if c1_sess.lock_file(WF_FILE_IDX, c1_lock, timeout=15) != "success":
+                    log.error("[%s] C1 %s failed", label, c1_lock)
+                    return 1
+                c1_unlock_idxs.append(WF_FILE_IDX)
+                if use_deleg:
+                    if _tsm_expect(
+                        ctx,
+                        baseline,
+                        label,
+                        open_since,
+                        True,
+                        open_delta=1,
+                        lock_delta=0,
+                        deleg_delta=1,
+                    ):
+                        return 1
+                elif _tsm_expect(
+                    ctx, baseline, label, open_since, True, open_delta=1, lock_delta=1
                 ):
                     return 1
-            elif _tsm_expect(
-                ctx, baseline, label, open_since, True, open_delta=1, lock_delta=1
-            ):
-                return 1
-        elif _tsm_expect(ctx, baseline, label, open_since, True, open_delta=1):
-            return 1
-        log.info("[%s] → success (TSM Node-id %s ok)", label, node_id)
+            else:
+                # With pre-grace lock held: open+1, lock unchanged (floor preserved)
+                if _tsm_expect(
+                    ctx, baseline, label, open_since, True, open_delta=1, lock_delta=0
+                ):
+                    return 1
+            log.info("[%s] → success (TSM Node-id %s ok)", label, node_id)
+        else:
+            announce(
+                f"[{tag}] skip C1 during-grace open "
+                f"(pre-grace holds index {pre_idx})"
+            )
 
         # --- C2 during grace ---
         label = f"{tag} C2 during {c2_mode}"
         announce(f"[{label}] open expect={c2_expect}")
         open_since, _ = get_node_time([ctx.server] + peers)
         baseline = peer_summary(peers, ctx.nfs_name, node_id=node_id)
-        c2_sess = InteractiveSession(
-            c2, base, tag=f"probe{int(time.time()) % 100000}"
-        )
-        if not c2_sess.start():
-            return 1
+        if not c2_sess:
+            c2_sess = InteractiveSession(
+                c2, base, tag=f"probe{int(time.time()) % 100000}"
+            )
+            if not c2_sess.start():
+                return 1
         timeout = 8 if c2_expect == "blocked" else 30
         got = c2_sess.open_file(WF_FILE_IDX, c2_mode, timeout=timeout)
         if got != c2_expect:
@@ -636,12 +884,41 @@ def tc_conflict_generic(ctx, spec, nfs_version="4.2"):
             return 1
 
         if c2_expect == "blocked":
-            if _validate_conflict_logs(ctx, c1_mode, c2_mode, open_since, label):
+            if _validate_conflict_logs(
+                ctx, conflict_existing_mode, c2_mode, open_since, label
+            ):
                 return 1
             if _tsm_expect(
                 ctx, baseline, label, open_since, False, open_delta=1
             ):
                 return 1
+            # Pre-grace floor still present
+            if pre_grace or pre_grace_c2:
+                if use_deleg:
+                    if int(baseline.get("open", 0)) < 1:
+                        log.error("[%s] pre-grace open missing during blocked open", label)
+                        return 1
+                    if int(baseline.get("deleg", 0)) < 1:
+                        log.error(
+                            "[%s] pre-grace deleg missing during blocked open", label
+                        )
+                        return 1
+                else:
+                    min_open = 2 if pre_grace_c2 else 1
+                    if int(baseline.get("open", 0)) < min_open:
+                        log.error(
+                            "[%s] pre-grace open floor missing "
+                            "(want≥%s got=%s)",
+                            label,
+                            min_open,
+                            baseline.get("open"),
+                        )
+                        return 1
+                    if int(baseline.get("lock", 0)) < 1:
+                        log.error(
+                            "[%s] pre-grace lock missing during blocked open", label
+                        )
+                        return 1
             log.info("[%s] → blocked (session kept for after-grace)", label)
 
             after_since, _ = get_node_time([ctx.server] + peers)
@@ -672,15 +949,14 @@ def tc_conflict_generic(ctx, spec, nfs_version="4.2"):
                 return 1
             log.info("[%s] → open success (TSM Node-id %s +1)", label, node_id)
         else:
-            # Compatible open during grace (optionally + lock)
             if c2_lock_during:
                 announce(f"[{label}] {c2_lock_during} expect=success")
                 if c2_sess.lock_file(WF_FILE_IDX, c2_lock_during, timeout=15) != "success":
                     log.error("[%s] C2 %s failed", label, c2_lock_during)
                     return 1
                 c2_held_lock = True
+                c2_unlock_idxs.append(WF_FILE_IDX)
                 if use_deleg:
-                    # Second read open+lock: open+1, lock+0, deleg+1 (1→2)
                     if _tsm_expect(
                         ctx,
                         baseline,
@@ -713,17 +989,27 @@ def tc_conflict_generic(ctx, spec, nfs_version="4.2"):
                 log.error("[%s] grace did not end in time", tag)
                 return 1
 
-        # --- Optional C2 lock(s) after open succeeded ---
         if c2_locks and _run_c2_locks(ctx, c2_sess, peers, node_id, tag, c2_locks):
             return 1
         if any(exp == "success" for _, exp in c2_locks):
             c2_held_lock = True
+            if WF_FILE_IDX not in c2_unlock_idxs:
+                c2_unlock_idxs.append(WF_FILE_IDX)
 
         log.info("[%s] PASSED", tag)
         return 0
     finally:
-        _close_and_stop(c2_sess, WF_FILE_IDX, unlock=c2_held_lock)
-        _close_and_stop(c1_sess, WF_FILE_IDX, unlock=bool(c1_lock))
+        unlock_c2 = list(c2_unlock_idxs) if c2_held_lock or c2_unlock_idxs else []
+        _close_and_stop(
+            c2_sess,
+            indexes=c2_close_idxs,
+            unlock_indexes=unlock_c2,
+        )
+        _close_and_stop(
+            c1_sess,
+            indexes=c1_close_idxs,
+            unlock_indexes=c1_unlock_idxs,
+        )
         release_cluster_grace(ctx)
 
 
