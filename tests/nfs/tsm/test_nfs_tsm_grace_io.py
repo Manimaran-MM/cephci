@@ -3,8 +3,10 @@
 Grace hold: spare open + iptables -I on spare client + spare NFS restart
 → ~90s cluster grace → C1/C2 conflict checks → unblock → after-grace TSM.
 
-TC-C01..C03: C1 WRITE_ONLY during grace; one C2 mode blocked (hangs), then
-same open completes after grace (TSM open +1, no fresh open).
+C01..C03: C1 WRITE_ONLY; C2 RO/WO/RW blocked then completes after grace.
+C04..C06: C1 READ_ONLY; C2 RO succeeds during grace; C2 WO/RW blocked then
+          completes after grace.
+C07..C09: C1 READ_WRITE; C2 RO/WO/RW blocked then completes after grace.
 """
 
 import re
@@ -60,19 +62,61 @@ CONFLICT_GRACE_RE = re.compile(
     r"Conflicting open\.\s*Return NFS4ERR_GRACE", re.I
 )
 
-# Each TC: C1 WO success during grace; one C2 mode blocked then completes after.
+# c2_expect: "blocked" → hang + after-grace complete; "success" → ok during grace.
 WORKFLOWS = {
     "TC-TSM-G-C01": {
         "desc": "C1 WRITE_ONLY; C2 READ_ONLY blocked then completes after grace",
+        "c1_mode": WO,
         "c2_mode": RO,
+        "c2_expect": "blocked",
     },
     "TC-TSM-G-C02": {
         "desc": "C1 WRITE_ONLY; C2 WRITE_ONLY blocked then completes after grace",
+        "c1_mode": WO,
         "c2_mode": WO,
+        "c2_expect": "blocked",
     },
     "TC-TSM-G-C03": {
         "desc": "C1 WRITE_ONLY; C2 READ_WRITE blocked then completes after grace",
+        "c1_mode": WO,
         "c2_mode": RW,
+        "c2_expect": "blocked",
+    },
+    "TC-TSM-G-C04": {
+        "desc": "C1 READ_ONLY; C2 READ_ONLY succeeds during grace (compatible)",
+        "c1_mode": RO,
+        "c2_mode": RO,
+        "c2_expect": "success",
+    },
+    "TC-TSM-G-C05": {
+        "desc": "C1 READ_ONLY; C2 WRITE_ONLY blocked then completes after grace",
+        "c1_mode": RO,
+        "c2_mode": WO,
+        "c2_expect": "blocked",
+    },
+    "TC-TSM-G-C06": {
+        "desc": "C1 READ_ONLY; C2 READ_WRITE blocked then completes after grace",
+        "c1_mode": RO,
+        "c2_mode": RW,
+        "c2_expect": "blocked",
+    },
+    "TC-TSM-G-C07": {
+        "desc": "C1 READ_WRITE; C2 READ_ONLY blocked then completes after grace",
+        "c1_mode": RW,
+        "c2_mode": RO,
+        "c2_expect": "blocked",
+    },
+    "TC-TSM-G-C08": {
+        "desc": "C1 READ_WRITE; C2 WRITE_ONLY blocked then completes after grace",
+        "c1_mode": RW,
+        "c2_mode": WO,
+        "c2_expect": "blocked",
+    },
+    "TC-TSM-G-C09": {
+        "desc": "C1 READ_WRITE; C2 READ_WRITE blocked then completes after grace",
+        "c1_mode": RW,
+        "c2_mode": RW,
+        "c2_expect": "blocked",
     },
 }
 
@@ -261,9 +305,11 @@ def _tsm_expect_open(ctx, baseline, want_delta, label, since, must_match):
 
 
 def tc_conflict_generic(ctx, spec, nfs_version="4.2"):
-    """One TC: C1 WO during grace; C2 mode blocked then completes after grace."""
+    """One TC: C1 open during grace; C2 success or blocked (+ after-grace if blocked)."""
     tag = spec["id"]
+    c1_mode = spec.get("c1_mode", WO)
     c2_mode = spec["c2_mode"]
+    c2_expect = spec.get("c2_expect", "blocked")
     c1, c2 = ctx.client_a, ctx.client_b
     if not c2 or ctx.server_node_id is None:
         log.error("[%s] need C2 client and server_node_id", tag)
@@ -302,21 +348,21 @@ def tc_conflict_generic(ctx, spec, nfs_version="4.2"):
 
         node_id = ctx.server_node_id
 
-        # --- C1 WRITE_ONLY during grace ---
-        label = f"{tag} C1 during {WO}"
+        # --- C1 during grace ---
+        label = f"{tag} C1 during {c1_mode}"
         announce(f"[{label}] open expect=success")
         baseline = peer_summary(peers, ctx.nfs_name, node_id=node_id)
         open_since, _ = get_node_time(peers)
-        if c1_sess.open_file(WF_FILE_IDX, WO, timeout=30) != "success":
+        if c1_sess.open_file(WF_FILE_IDX, c1_mode, timeout=30) != "success":
             log.error("[%s] C1 open failed", label)
             return 1
         if _tsm_expect_open(ctx, baseline, 1, label, open_since, must_match=True):
             return 1
         log.info("[%s] → success (TSM Node-id %s ok)", label, node_id)
 
-        # --- C2 during grace (blocked; keep session hanging) ---
+        # --- C2 during grace ---
         label = f"{tag} C2 during {c2_mode}"
-        announce(f"[{label}] open expect=blocked")
+        announce(f"[{label}] open expect={c2_expect}")
         open_since, _ = get_node_time([ctx.server] + peers)
         baseline = peer_summary(peers, ctx.nfs_name, node_id=node_id)
         c2_sess = InteractiveSession(
@@ -324,35 +370,50 @@ def tc_conflict_generic(ctx, spec, nfs_version="4.2"):
         )
         if not c2_sess.start():
             return 1
-        if c2_sess.open_file(WF_FILE_IDX, c2_mode, timeout=8) != "blocked":
-            log.error("[%s] expected blocked", label)
-            return 1
-        if _validate_conflict_logs(ctx, WO, c2_mode, open_since, label):
-            return 1
-        if _tsm_expect_open(ctx, baseline, 1, label, open_since, must_match=False):
-            return 1
-        log.info("[%s] → blocked (session kept for after-grace)", label)
-
-        # Stamp before unblock so --since includes open+1 logged at grace exit
-        after_since, _ = get_node_time([ctx.server] + peers)
-
-        announce(f"[{tag}] unblock spare TCP (end grace hold)")
-        unblock_cluster_grace(ctx)
-
-        announce(f"[{tag}] wait NOT IN GRACE")
-        if wait_grace_exit(ctx, grace_since, timeout=150):
-            log.error("[%s] grace did not end in time", tag)
+        timeout = 8 if c2_expect == "blocked" else 30
+        got = c2_sess.open_file(WF_FILE_IDX, c2_mode, timeout=timeout)
+        if got != c2_expect:
+            log.error("[%s] open want=%s got=%s", label, c2_expect, got)
             return 1
 
-        # --- After grace: same hanging open completes; TSM +1 ---
-        label = f"{tag} C2 after {c2_mode} (same open)"
-        announce(f"[{label}] wait hanging open; TSM +1 (no fresh open)")
-        if c2_sess.wait_opened(WF_FILE_IDX, timeout=90) != "success":
-            log.error("[%s] hanging open did not complete", label)
-            return 1
-        if _tsm_expect_open(ctx, baseline, 1, label, after_since, must_match=True):
-            return 1
-        log.info("[%s] → success (TSM Node-id %s +1)", label, node_id)
+        if c2_expect == "blocked":
+            if _validate_conflict_logs(ctx, c1_mode, c2_mode, open_since, label):
+                return 1
+            if _tsm_expect_open(ctx, baseline, 1, label, open_since, must_match=False):
+                return 1
+            log.info("[%s] → blocked (session kept for after-grace)", label)
+
+            # Stamp before unblock so --since includes open+1 at grace exit
+            after_since, _ = get_node_time([ctx.server] + peers)
+
+            announce(f"[{tag}] unblock spare TCP (end grace hold)")
+            unblock_cluster_grace(ctx)
+
+            announce(f"[{tag}] wait NOT IN GRACE")
+            if wait_grace_exit(ctx, grace_since, timeout=150):
+                log.error("[%s] grace did not end in time", tag)
+                return 1
+
+            label = f"{tag} C2 after {c2_mode} (same open)"
+            announce(f"[{label}] wait hanging open; TSM +1 (no fresh open)")
+            if c2_sess.wait_opened(WF_FILE_IDX, timeout=90) != "success":
+                log.error("[%s] hanging open did not complete", label)
+                return 1
+            if _tsm_expect_open(ctx, baseline, 1, label, after_since, must_match=True):
+                return 1
+            log.info("[%s] → success (TSM Node-id %s +1)", label, node_id)
+        else:
+            # Compatible open (e.g. RO+RO): TSM +1 during grace; no after-grace wait
+            if _tsm_expect_open(ctx, baseline, 1, label, open_since, must_match=True):
+                return 1
+            log.info("[%s] → success (TSM Node-id %s ok)", label, node_id)
+
+            announce(f"[{tag}] unblock spare TCP (end grace hold)")
+            unblock_cluster_grace(ctx)
+            announce(f"[{tag}] wait NOT IN GRACE")
+            if wait_grace_exit(ctx, grace_since, timeout=150):
+                log.error("[%s] grace did not end in time", tag)
+                return 1
 
         log.info("[%s] PASSED", tag)
         return 0
