@@ -10,6 +10,9 @@ C07..C09: C1 READ_WRITE; C2 RO/WO/RW blocked then completes after grace.
 C10: C1 WO+nwlock; C2 RW blocked at open → after grace open ok; nrlock+nwlock denied.
 C11: C1 RO+nrlock; C2 RO+nrlock both succeed during grace (compatible).
 C12: C1 RO+nrlock; C2 RW blocked → after grace open ok; nwlock denied then nrlock ok.
+C13: deleg export type5; C1 WO+nwlock; C2 RW blocked → recall; nrlock+nwlock denied.
+C14: deleg export type4; C1 RO+nrlock; C2 RW blocked → nwlock denied then nrlock ok.
+C15: deleg export type4; C1 RO+nrlock; C2 RO+nrlock both succeed (deleg 1→2).
 """
 
 import re
@@ -154,6 +157,49 @@ WORKFLOWS = {
         "c2_expect": "blocked",
         "c2_locks": [("nwlock", "denied"), ("nrlock", "success")],
     },
+    # --- Deleg export (delegations=rw): C13 write-deleg, C14/C15 read-deleg ---
+    "TC-TSM-G-C13": {
+        "desc": (
+            "deleg type5: C1 WO+nwlock; C2 RW blocked; after grace recall; "
+            "nrlock then nwlock denied"
+        ),
+        "use_deleg_export": True,
+        "c1_mode": WO,
+        "c1_lock": "nwlock",
+        "c2_mode": RW,
+        "c2_expect": "blocked",
+        # After C2 open: recall → C1's client-local lock lands in TSM
+        "after_open_lock_delta": 1,
+        "after_open_deleg_delta": -1,  # recall 1→0
+        "c2_locks": [("nrlock", "denied"), ("nwlock", "denied")],
+    },
+    "TC-TSM-G-C14": {
+        "desc": (
+            "deleg type4: C1 RO+nrlock; C2 RW blocked; after grace open ok; "
+            "nwlock denied then nrlock success"
+        ),
+        "use_deleg_export": True,
+        "c1_mode": RO,
+        "c1_lock": "nrlock",
+        "c2_mode": RW,
+        "c2_expect": "blocked",
+        # After C2 open: recall → C1's client-local lock lands in TSM
+        "after_open_lock_delta": 1,
+        "after_open_deleg_delta": -1,  # recall 1→0
+        "c2_locks": [("nwlock", "denied"), ("nrlock", "success")],
+    },
+    "TC-TSM-G-C15": {
+        "desc": (
+            "deleg type4: C1 RO+nrlock; C2 RO+nrlock both succeed during grace "
+            "(deleg 1→2)"
+        ),
+        "use_deleg_export": True,
+        "c1_mode": RO,
+        "c1_lock": "nrlock",
+        "c2_mode": RO,
+        "c2_expect": "success",
+        "c2_lock_during": "nrlock",
+    },
 }
 
 
@@ -256,6 +302,70 @@ def _start_spare_hold(ctx):
     return sess
 
 
+def _ensure_deleg_export(ctx, nfs_version):
+    """Create primary-style export with delegations=rw; mount on workflow clients once."""
+    if getattr(ctx, "_deleg_ready", False):
+        return 0
+    if not ctx.deleg_export or not ctx.deleg_mount:
+        log.error("ctx.deleg_export / ctx.deleg_mount not set")
+        return 1
+
+    client = ctx.client_a
+    announce(f"Create/mount deleg export {ctx.deleg_export} (delegations=rw)")
+    try:
+        Ceph(client).nfs.export.create(
+            fs_name="cephfs",
+            nfs_name=ctx.nfs_name,
+            nfs_export=ctx.deleg_export,
+            fs="cephfs",
+        )
+    except Exception as exc:
+        log.warning("deleg export create: %s (may already exist)", exc)
+    # Set export-level delegations=rw (ceph CLI on client; same as other grace cmds)
+    try:
+        client.exec_command(
+            sudo=True,
+            cmd=f"ceph nfs export update {ctx.nfs_name} {ctx.deleg_export} rw",
+        )
+    except Exception as exc:
+        log.error("set delegations=rw on %s failed: %s", ctx.deleg_export, exc)
+        return 1
+    out, _ = client.exec_command(
+        sudo=True,
+        cmd=f"ceph nfs export info {ctx.nfs_name} {ctx.deleg_export} -f json",
+        check_ec=False,
+    )
+    if "rw" not in (out or "").lower():
+        log.warning(
+            "delegations=rw not confirmed in export info (got %r); continuing",
+            (out or "")[:200],
+        )
+    NfsMultiActiveConfig.wait_until_export_visible(
+        client, ctx.nfs_name, ctx.deleg_export
+    )
+    for c in ctx.clients:
+        c.create_dirs(dir_path=ctx.deleg_mount, sudo=True)
+        out, _ = c.exec_command(
+            sudo=True,
+            cmd=f"mountpoint -q {ctx.deleg_mount} && echo ok",
+            check_ec=False,
+        )
+        if "ok" in (out or ""):
+            continue
+        if Mount(c).nfs(
+            mount=ctx.deleg_mount,
+            version=str(nfs_version),
+            port=str(ctx.nfs_port),
+            server=ctx.server.hostname,
+            export=ctx.deleg_export,
+        ):
+            log.error("Deleg mount failed on %s", c.hostname)
+            return 1
+    ctx._deleg_ready = True
+    log.info("Deleg export ready: %s -> %s", ctx.deleg_export, ctx.deleg_mount)
+    return 0
+
+
 def _validate_conflict_logs(ctx, c1_mode, c2_mode, since, label):
     """Require Open conflict existing_sa/new_sa + NFS4ERR_GRACE on mount server."""
     existing_sa, new_sa = SHARE_ACCESS[c1_mode], SHARE_ACCESS[c2_mode]
@@ -293,24 +403,34 @@ def _validate_conflict_logs(ctx, c1_mode, c2_mode, since, label):
 
 
 def _tsm_expect(
-    ctx, baseline, label, since, must_match, open_delta=0, lock_delta=0
+    ctx,
+    baseline,
+    label,
+    since,
+    must_match,
+    open_delta=0,
+    lock_delta=0,
+    deleg_delta=None,
 ):
-    """Check Node-id open/lock vs baseline+deltas.
+    """Check Node-id open/lock/(optional deleg) vs baseline+deltas.
 
     must_match=True  → wait until counts match
     must_match=False → fail if the bumped field(s) already match (blocked/denied)
+    deleg_delta=None → do not assert deleg (C01–C12); int → assert base+delta
     """
     peers = _workflow_peers(ctx)
     node_id = ctx.server_node_id
     base_open = int((baseline or {}).get("open", 0))
     base_lock = int((baseline or {}).get("lock", 0))
+    base_deleg = int((baseline or {}).get("deleg", 0))
     want_open = base_open + open_delta
     want_lock = base_lock + lock_delta
+    want_deleg = None if deleg_delta is None else base_deleg + deleg_delta
 
     if must_match:
         announce(
             f"[{label}] validate TSM Node-id {node_id}",
-            fmt_tsm(want_open, want_lock),
+            fmt_tsm(want_open, want_lock, want_deleg),
         )
         if (
             wait_peer_counts(
@@ -320,6 +440,7 @@ def _tsm_expect(
                 want_open,
                 want_lock,
                 label,
+                expect_deleg=want_deleg,
                 timeout=60,
                 node_id=node_id,
             )
@@ -330,7 +451,7 @@ def _tsm_expect(
 
     announce(
         f"[{label}] TSM Node-id {node_id} must NOT match "
-        f"{fmt_tsm(want_open if open_delta else base_open, want_lock if lock_delta else base_lock)}"
+        f"{fmt_tsm(want_open if open_delta else base_open, want_lock if lock_delta else base_lock, want_deleg)}"
     )
     time.sleep(2)
     snap = peer_summary(peers, ctx.nfs_name, since=since, node_id=node_id)
@@ -347,11 +468,17 @@ def _tsm_expect(
             "[%s] unexpected TSM lock=%s on Node-id %s", label, want_lock, node_id
         )
         return 1
+    if deleg_delta is not None and int(snap.get("deleg", 0)) == want_deleg:
+        log.error(
+            "[%s] unexpected TSM deleg=%s on Node-id %s", label, want_deleg, node_id
+        )
+        return 1
     log.info(
-        "[%s] no TSM bump match (open=%s lock=%s) — ok",
+        "[%s] no TSM bump match (open=%s lock=%s deleg=%s) — ok",
         label,
         snap.get("open"),
         snap.get("lock"),
+        snap.get("deleg"),
     )
     return 0
 
@@ -403,12 +530,15 @@ def _run_c2_locks(ctx, c2_sess, peers, node_id, tag, locks):
 def tc_conflict_generic(ctx, spec, nfs_version="4.2"):
     """One TC: C1 open[/lock] during grace; C2 open success|blocked; optional c2 lock."""
     tag = spec["id"]
+    use_deleg = bool(spec.get("use_deleg_export"))
     c1_mode = spec.get("c1_mode", WO)
     c1_lock = spec.get("c1_lock")  # e.g. nwlock
     c2_mode = spec["c2_mode"]
     c2_expect = spec.get("c2_expect", "blocked")
     c2_lock_during = spec.get("c2_lock_during")  # lock during grace (with open success)
     c2_locks = _normalize_c2_locks(spec)
+    after_open_deleg_delta = spec.get("after_open_deleg_delta")  # None | int
+    after_open_lock_delta = spec.get("after_open_lock_delta", 0)
     c1, c2 = ctx.client_a, ctx.client_b
     if not c2 or ctx.server_node_id is None:
         log.error("[%s] need C2 client and server_node_id", tag)
@@ -416,8 +546,16 @@ def tc_conflict_generic(ctx, spec, nfs_version="4.2"):
     if ensure_interactive_binary(c1) or ensure_interactive_binary(c2):
         return 1
 
-    _seed_wf_file(c1, ctx.mount)
-    time.sleep(1)
+    if use_deleg:
+        if _ensure_deleg_export(ctx, nfs_version):
+            return 1
+        mount = ctx.deleg_mount
+    else:
+        mount = ctx.mount
+
+    _seed_wf_file(c1, mount)
+    # Seed write may briefly grant write-deleg; let it return before grace opens.
+    time.sleep(3 if use_deleg else 1)
     if _mount_spare(ctx, nfs_version):
         return 1
 
@@ -440,7 +578,7 @@ def tc_conflict_generic(ctx, spec, nfs_version="4.2"):
             log.error("[%s] need ≥1 peer for TSM summary", tag)
             return 1
 
-        base = _file_base(ctx.mount)
+        base = _file_base(mount)
         c1_sess = InteractiveSession(c1, base, tag="c1")
         if not c1_sess.start():
             return 1
@@ -460,7 +598,20 @@ def tc_conflict_generic(ctx, spec, nfs_version="4.2"):
             if c1_sess.lock_file(WF_FILE_IDX, c1_lock, timeout=15) != "success":
                 log.error("[%s] C1 %s failed", label, c1_lock)
                 return 1
-            if _tsm_expect(
+            # Deleg profile: open+1 lock+0 deleg+1 (lock stays client-local)
+            if use_deleg:
+                if _tsm_expect(
+                    ctx,
+                    baseline,
+                    label,
+                    open_since,
+                    True,
+                    open_delta=1,
+                    lock_delta=0,
+                    deleg_delta=1,
+                ):
+                    return 1
+            elif _tsm_expect(
                 ctx, baseline, label, open_since, True, open_delta=1, lock_delta=1
             ):
                 return 1
@@ -509,7 +660,14 @@ def tc_conflict_generic(ctx, spec, nfs_version="4.2"):
                 log.error("[%s] hanging open did not complete", label)
                 return 1
             if _tsm_expect(
-                ctx, baseline, label, after_since, True, open_delta=1, lock_delta=0
+                ctx,
+                baseline,
+                label,
+                after_since,
+                True,
+                open_delta=1,
+                lock_delta=after_open_lock_delta,
+                deleg_delta=after_open_deleg_delta,
             ):
                 return 1
             log.info("[%s] → open success (TSM Node-id %s +1)", label, node_id)
@@ -521,7 +679,20 @@ def tc_conflict_generic(ctx, spec, nfs_version="4.2"):
                     log.error("[%s] C2 %s failed", label, c2_lock_during)
                     return 1
                 c2_held_lock = True
-                if _tsm_expect(
+                if use_deleg:
+                    # Second read open+lock: open+1, lock+0, deleg+1 (1→2)
+                    if _tsm_expect(
+                        ctx,
+                        baseline,
+                        label,
+                        open_since,
+                        True,
+                        open_delta=1,
+                        lock_delta=0,
+                        deleg_delta=1,
+                    ):
+                        return 1
+                elif _tsm_expect(
                     ctx,
                     baseline,
                     label,
@@ -542,7 +713,7 @@ def tc_conflict_generic(ctx, spec, nfs_version="4.2"):
                 log.error("[%s] grace did not end in time", tag)
                 return 1
 
-        # --- Optional C2 lock(s) after open succeeded (C10/C12) ---
+        # --- Optional C2 lock(s) after open succeeded ---
         if c2_locks and _run_c2_locks(ctx, c2_sess, peers, node_id, tag, c2_locks):
             return 1
         if any(exp == "success" for _, exp in c2_locks):
@@ -551,7 +722,6 @@ def tc_conflict_generic(ctx, spec, nfs_version="4.2"):
         log.info("[%s] PASSED", tag)
         return 0
     finally:
-        # Unlock before close when a session holds a lock (C10–C12)
         _close_and_stop(c2_sess, WF_FILE_IDX, unlock=c2_held_lock)
         _close_and_stop(c1_sess, WF_FILE_IDX, unlock=bool(c1_lock))
         release_cluster_grace(ctx)
@@ -563,17 +733,20 @@ def _log_tc_overview(ctx):
     ids = ", ".join(
         f"{h}={nid}" for h, nid in sorted(ctx.tsm_node_ids.items())
     ) or "N/A"
+    deleg = getattr(ctx, "deleg_export", None) or "N/A"
     log.info(
         "\n========== OVERVIEW =========================\n"
         "Spare node - %s\n"
         "Spare Client - %s\n"
         "Spare Export - %s\n"
+        "Deleg Export - %s\n"
         "Client-1/2 Mounts to - %s (TSM Node-id %s)\n"
         "TSM Node-id map - %s\n"
         "============ OVERVIEW =======================",
         spare,
         ctx.spare_client.hostname if ctx.spare_client else "N/A",
         ctx.spare_export or "N/A",
+        deleg,
         primary,
         ctx.server_node_id,
         ids,
@@ -606,6 +779,8 @@ def run(ceph_cluster, **kw):
     mount = f"/mnt/nfs_{name}"
     spare_export = f"/export_{name}_spare"
     spare_mount = f"/mnt/nfs_{name}_spare"
+    deleg_export = f"/export_{name}_deleg"
+    deleg_mount = f"/mnt/nfs_{name}_deleg"
     results = {}
     ctx = None
 
@@ -660,6 +835,9 @@ def run(ceph_cluster, **kw):
             tsm_port=TSM_PORT,
             tsm_node_ids=tsm_node_ids,
         )
+        ctx.deleg_export = deleg_export
+        ctx.deleg_mount = deleg_mount
+        ctx._deleg_ready = False
 
         cases = selected or list(WORKFLOWS.keys())
         _, coredump_since = get_node_time(nodes)
@@ -711,12 +889,27 @@ def run(ceph_cluster, **kw):
                     )
                 except Exception as exc:
                     log.warning("spare export delete: %s", exc)
-        safe_cleanup(use_clients[0], mount, nfs_name, export, nodes)
-        for client in use_clients[1:]:
+            if getattr(ctx, "_deleg_ready", False) and ctx.deleg_mount:
+                for c in ctx.clients:
+                    c.exec_command(
+                        sudo=True,
+                        cmd=f"umount -l {ctx.deleg_mount} 2>/dev/null",
+                        check_ec=False,
+                    )
+                try:
+                    Ceph(ctx.client_a).nfs.export.delete(
+                        ctx.nfs_name, ctx.deleg_export
+                    )
+                except Exception as exc:
+                    log.warning("deleg export delete: %s", exc)
+        # Unmount all clients before NFS cluster delete (safe_cleanup only
+        # umounts use_clients[0]).
+        for client in use_clients:
             client.exec_command(
                 sudo=True,
                 cmd=f"umount -l {mount} 2>/dev/null",
                 check_ec=False,
             )
+        safe_cleanup(use_clients[0], mount, nfs_name, export, nodes)
 
     return log_workflow_summary(results, title="TSM GRACE IO SUMMARY")
