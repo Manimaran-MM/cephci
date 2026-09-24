@@ -7,6 +7,9 @@ C01..C03: C1 WRITE_ONLY; C2 RO/WO/RW blocked then completes after grace.
 C04..C06: C1 READ_ONLY; C2 RO succeeds during grace; C2 WO/RW blocked then
           completes after grace.
 C07..C09: C1 READ_WRITE; C2 RO/WO/RW blocked then completes after grace.
+C10: C1 WO+nwlock; C2 RW blocked at open → after grace open ok; nrlock+nwlock denied.
+C11: C1 RO+nrlock; C2 RO+nrlock both succeed during grace (compatible).
+C12: C1 RO+nrlock; C2 RW blocked → after grace open ok; nwlock denied then nrlock ok.
 """
 
 import re
@@ -118,6 +121,39 @@ WORKFLOWS = {
         "c2_mode": RW,
         "c2_expect": "blocked",
     },
+    # C1 WO + nwlock; C2 RW open blocked → after grace open ok; nrlock then nwlock denied
+    "TC-TSM-G-C10": {
+        "desc": (
+            "C1 WO+nwlock; C2 RW blocked at open, after grace open ok; "
+            "nrlock then nwlock denied"
+        ),
+        "c1_mode": WO,
+        "c1_lock": "nwlock",
+        "c2_mode": RW,
+        "c2_expect": "blocked",
+        "c2_locks": [("nrlock", "denied"), ("nwlock", "denied")],
+    },
+    # C1 RO + nrlock; C2 RO + nrlock both success during grace
+    "TC-TSM-G-C11": {
+        "desc": "C1 RO+nrlock; C2 RO+nrlock both succeed during grace (compatible)",
+        "c1_mode": RO,
+        "c1_lock": "nrlock",
+        "c2_mode": RO,
+        "c2_expect": "success",
+        "c2_lock_during": "nrlock",
+    },
+    # C1 RO + nrlock; C2 RW blocked → after grace open; nwlock denied, nrlock success
+    "TC-TSM-G-C12": {
+        "desc": (
+            "C1 RO+nrlock; C2 RW blocked at open, after grace open ok; "
+            "nwlock denied then nrlock success"
+        ),
+        "c1_mode": RO,
+        "c1_lock": "nrlock",
+        "c2_mode": RW,
+        "c2_expect": "blocked",
+        "c2_locks": [("nwlock", "denied"), ("nrlock", "success")],
+    },
 }
 
 
@@ -146,11 +182,15 @@ def _workflow_peers(ctx):
     return [n for n in peers if n.hostname != ctx.spare_node.hostname]
 
 
-def _close_and_stop(sess, index=None):
+def _close_and_stop(sess, index=None, unlock=False):
+    """Close held index (optional unlock first), then stop the session."""
     if not sess:
         return
     try:
         if index is not None:
+            if unlock:
+                sess.send(f"unlock {index}")
+                time.sleep(1)
             sess.send(f"close {index}")
             time.sleep(1)
         sess.stop()
@@ -252,30 +292,33 @@ def _validate_conflict_logs(ctx, c1_mode, c2_mode, since, label):
     return 1
 
 
-def _tsm_expect_open(ctx, baseline, want_delta, label, since, must_match):
-    """Check Node-id open count vs baseline+delta.
+def _tsm_expect(
+    ctx, baseline, label, since, must_match, open_delta=0, lock_delta=0
+):
+    """Check Node-id open/lock vs baseline+deltas.
 
-    must_match=True  → wait until open == baseline+delta (success path)
-    must_match=False → fail if open == baseline+delta (blocked path)
+    must_match=True  → wait until counts match
+    must_match=False → fail if the bumped field(s) already match (blocked/denied)
     """
     peers = _workflow_peers(ctx)
     node_id = ctx.server_node_id
     base_open = int((baseline or {}).get("open", 0))
     base_lock = int((baseline or {}).get("lock", 0))
-    want = base_open + want_delta
+    want_open = base_open + open_delta
+    want_lock = base_lock + lock_delta
 
     if must_match:
         announce(
             f"[{label}] validate TSM Node-id {node_id}",
-            fmt_tsm(want, base_lock),
+            fmt_tsm(want_open, want_lock),
         )
         if (
             wait_peer_counts(
                 peers,
                 ctx.nfs_name,
                 since,
-                want,
-                base_lock,
+                want_open,
+                want_lock,
                 label,
                 timeout=60,
                 node_id=node_id,
@@ -285,31 +328,87 @@ def _tsm_expect_open(ctx, baseline, want_delta, label, since, must_match):
             return 1
         return 0
 
-    announce(f"[{label}] blocked: TSM Node-id {node_id} must NOT match open={want}")
+    announce(
+        f"[{label}] TSM Node-id {node_id} must NOT match "
+        f"{fmt_tsm(want_open if open_delta else base_open, want_lock if lock_delta else base_lock)}"
+    )
     time.sleep(2)
     snap = peer_summary(peers, ctx.nfs_name, since=since, node_id=node_id)
-    if snap.get("seen") and int(snap.get("open", 0)) == want:
+    if not snap.get("seen"):
+        log.info("[%s] no TSM summary yet — ok for blocked/denied", label)
+        return 0
+    if open_delta and int(snap.get("open", 0)) == want_open:
         log.error(
-            "[%s] unexpected TSM open=%s on Node-id %s for blocked open",
-            label,
-            want,
-            node_id,
+            "[%s] unexpected TSM open=%s on Node-id %s", label, want_open, node_id
+        )
+        return 1
+    if lock_delta and int(snap.get("lock", 0)) == want_lock:
+        log.error(
+            "[%s] unexpected TSM lock=%s on Node-id %s", label, want_lock, node_id
         )
         return 1
     log.info(
-        "[%s] no TSM open +1 match (seen=%s) — ok for blocked",
+        "[%s] no TSM bump match (open=%s lock=%s) — ok",
         label,
-        snap.get("seen"),
+        snap.get("open"),
+        snap.get("lock"),
     )
     return 0
 
 
+def _normalize_c2_locks(spec):
+    """Return [(kind, expect), ...] from c2_locks / legacy c2_lock + c2_lock_expect."""
+    locks = spec.get("c2_locks")
+    if locks:
+        out = []
+        default = spec.get("c2_lock_expect", "denied")
+        for item in locks:
+            if isinstance(item, (list, tuple)) and len(item) == 2:
+                out.append((item[0], item[1]))
+            else:
+                out.append((item, default))
+        return out
+    kind = spec.get("c2_lock")
+    if kind:
+        return [(kind, spec.get("c2_lock_expect", "denied"))]
+    return []
+
+
+def _run_c2_locks(ctx, c2_sess, peers, node_id, tag, locks):
+    """Apply C2 lock steps after open is held. Return 0 ok, 1 fail."""
+    for kind, expect in locks:
+        label = f"{tag} C2 {kind} after open"
+        announce(f"[{label}] expect={expect}")
+        lock_since, _ = get_node_time([ctx.server] + peers)
+        lock_base = peer_summary(peers, ctx.nfs_name, node_id=node_id)
+        got = c2_sess.lock_file(WF_FILE_IDX, kind, timeout=15)
+        if got != expect:
+            log.error("[%s] want=%s got=%s", label, expect, got)
+            return 1
+        if expect == "denied":
+            if _tsm_expect(
+                ctx, lock_base, label, lock_since, False, lock_delta=1
+            ):
+                return 1
+            log.info("[%s] → denied (TSM lock not bumped)", label)
+        else:
+            if _tsm_expect(
+                ctx, lock_base, label, lock_since, True, lock_delta=1
+            ):
+                return 1
+            log.info("[%s] → success (TSM lock +1)", label)
+    return 0
+
+
 def tc_conflict_generic(ctx, spec, nfs_version="4.2"):
-    """One TC: C1 open during grace; C2 success or blocked (+ after-grace if blocked)."""
+    """One TC: C1 open[/lock] during grace; C2 open success|blocked; optional c2 lock."""
     tag = spec["id"]
     c1_mode = spec.get("c1_mode", WO)
+    c1_lock = spec.get("c1_lock")  # e.g. nwlock
     c2_mode = spec["c2_mode"]
     c2_expect = spec.get("c2_expect", "blocked")
+    c2_lock_during = spec.get("c2_lock_during")  # lock during grace (with open success)
+    c2_locks = _normalize_c2_locks(spec)
     c1, c2 = ctx.client_a, ctx.client_b
     if not c2 or ctx.server_node_id is None:
         log.error("[%s] need C2 client and server_node_id", tag)
@@ -325,11 +424,11 @@ def tc_conflict_generic(ctx, spec, nfs_version="4.2"):
     spare_sess = _start_spare_hold(ctx)
     if not spare_sess:
         return 1
-    # Ensure release_cluster_grace can close spare even if hold_cluster_grace fails early
     ctx._spare_session = spare_sess
 
     c1_sess = None
     c2_sess = None
+    c2_held_lock = False
     try:
         announce(f"[{tag}] hold cluster grace (spare + iptables -I)")
         rc, grace_since = hold_cluster_grace(ctx, spare_sess)
@@ -349,14 +448,23 @@ def tc_conflict_generic(ctx, spec, nfs_version="4.2"):
         node_id = ctx.server_node_id
 
         # --- C1 during grace ---
-        label = f"{tag} C1 during {c1_mode}"
+        label = f"{tag} C1 during {c1_mode}" + (f"+{c1_lock}" if c1_lock else "")
         announce(f"[{label}] open expect=success")
         baseline = peer_summary(peers, ctx.nfs_name, node_id=node_id)
         open_since, _ = get_node_time(peers)
         if c1_sess.open_file(WF_FILE_IDX, c1_mode, timeout=30) != "success":
             log.error("[%s] C1 open failed", label)
             return 1
-        if _tsm_expect_open(ctx, baseline, 1, label, open_since, must_match=True):
+        if c1_lock:
+            announce(f"[{label}] {c1_lock} expect=success")
+            if c1_sess.lock_file(WF_FILE_IDX, c1_lock, timeout=15) != "success":
+                log.error("[%s] C1 %s failed", label, c1_lock)
+                return 1
+            if _tsm_expect(
+                ctx, baseline, label, open_since, True, open_delta=1, lock_delta=1
+            ):
+                return 1
+        elif _tsm_expect(ctx, baseline, label, open_since, True, open_delta=1):
             return 1
         log.info("[%s] → success (TSM Node-id %s ok)", label, node_id)
 
@@ -379,11 +487,12 @@ def tc_conflict_generic(ctx, spec, nfs_version="4.2"):
         if c2_expect == "blocked":
             if _validate_conflict_logs(ctx, c1_mode, c2_mode, open_since, label):
                 return 1
-            if _tsm_expect_open(ctx, baseline, 1, label, open_since, must_match=False):
+            if _tsm_expect(
+                ctx, baseline, label, open_since, False, open_delta=1
+            ):
                 return 1
             log.info("[%s] → blocked (session kept for after-grace)", label)
 
-            # Stamp before unblock so --since includes open+1 at grace exit
             after_since, _ = get_node_time([ctx.server] + peers)
 
             announce(f"[{tag}] unblock spare TCP (end grace hold)")
@@ -395,16 +504,34 @@ def tc_conflict_generic(ctx, spec, nfs_version="4.2"):
                 return 1
 
             label = f"{tag} C2 after {c2_mode} (same open)"
-            announce(f"[{label}] wait hanging open; TSM +1 (no fresh open)")
+            announce(f"[{label}] wait hanging open; TSM open +1 (no fresh open)")
             if c2_sess.wait_opened(WF_FILE_IDX, timeout=90) != "success":
                 log.error("[%s] hanging open did not complete", label)
                 return 1
-            if _tsm_expect_open(ctx, baseline, 1, label, after_since, must_match=True):
+            if _tsm_expect(
+                ctx, baseline, label, after_since, True, open_delta=1, lock_delta=0
+            ):
                 return 1
-            log.info("[%s] → success (TSM Node-id %s +1)", label, node_id)
+            log.info("[%s] → open success (TSM Node-id %s +1)", label, node_id)
         else:
-            # Compatible open (e.g. RO+RO): TSM +1 during grace; no after-grace wait
-            if _tsm_expect_open(ctx, baseline, 1, label, open_since, must_match=True):
+            # Compatible open during grace (optionally + lock)
+            if c2_lock_during:
+                announce(f"[{label}] {c2_lock_during} expect=success")
+                if c2_sess.lock_file(WF_FILE_IDX, c2_lock_during, timeout=15) != "success":
+                    log.error("[%s] C2 %s failed", label, c2_lock_during)
+                    return 1
+                c2_held_lock = True
+                if _tsm_expect(
+                    ctx,
+                    baseline,
+                    label,
+                    open_since,
+                    True,
+                    open_delta=1,
+                    lock_delta=1,
+                ):
+                    return 1
+            elif _tsm_expect(ctx, baseline, label, open_since, True, open_delta=1):
                 return 1
             log.info("[%s] → success (TSM Node-id %s ok)", label, node_id)
 
@@ -415,11 +542,18 @@ def tc_conflict_generic(ctx, spec, nfs_version="4.2"):
                 log.error("[%s] grace did not end in time", tag)
                 return 1
 
+        # --- Optional C2 lock(s) after open succeeded (C10/C12) ---
+        if c2_locks and _run_c2_locks(ctx, c2_sess, peers, node_id, tag, c2_locks):
+            return 1
+        if any(exp == "success" for _, exp in c2_locks):
+            c2_held_lock = True
+
         log.info("[%s] PASSED", tag)
         return 0
     finally:
-        _close_and_stop(c2_sess, WF_FILE_IDX)
-        _close_and_stop(c1_sess, WF_FILE_IDX)
+        # Unlock before close when a session holds a lock (C10–C12)
+        _close_and_stop(c2_sess, WF_FILE_IDX, unlock=c2_held_lock)
+        _close_and_stop(c1_sess, WF_FILE_IDX, unlock=bool(c1_lock))
         release_cluster_grace(ctx)
 
 
