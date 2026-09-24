@@ -198,6 +198,35 @@ class InteractiveSession:
         """Wait for a hanging open to complete — no new send."""
         return self._poll_open(index, timeout, before=None)
 
+    def lock_file(self, index, kind, timeout=15):
+        """Issue ``nrlock|nwlock|rlock|wlock <index>``.
+
+        Returns 'success' | 'denied' | 'error' | 'blocked'.
+        Non-blocking locks that conflict return 'denied' (F_SETLK EAGAIN).
+        """
+        before = self._cat_out()
+        self._offset = len(before)
+        self.send(f"{kind} {index}")
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            _, full = self._read_new()
+            chunk = self._delta(full, before)
+            low = chunk.lower()
+            if f"locked index {index}" in low:
+                self._log_out(chunk, label=f"{kind} {index} success")
+                return "success"
+            if "lock failed" in low:
+                self._log_out(chunk, label=f"{kind} {index} denied")
+                return "denied"
+            if "not open" in low or "already has" in low:
+                self._log_out(chunk, label=f"{kind} {index} error")
+                return "error"
+            time.sleep(0.5)
+        _, full = self._read_new()
+        chunk = self._delta(full, before)
+        self._log_out(chunk, label=f"{kind} {index} blocked")
+        return "blocked"
+
     def stop(self):
         """Quit/kill helper and remove FIFO/outfile. Safe if start never succeeded."""
         c = self.client
