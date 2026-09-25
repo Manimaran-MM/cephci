@@ -228,7 +228,10 @@ class InteractiveSession:
         return "blocked"
 
     def stop(self):
-        """Quit/kill helper and remove FIFO/outfile. Safe if start never succeeded."""
+        """Quit/kill helper and remove FIFO/outfile. Safe if start never succeeded.
+
+        Sends quit so fds are closed (NFS CLOSE).
+        """
         c = self.client
         if self.pid:
             try:
