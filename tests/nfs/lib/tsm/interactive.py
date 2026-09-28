@@ -153,7 +153,7 @@ class InteractiveSession:
         return full[len(before) :] if full.startswith(before) else full
 
     def _poll_open(self, index, timeout, before=None):
-        """Poll for open result. Returns success|blocked|error."""
+        """Poll for open result. Returns success|blocked|denied|error."""
         deadline = time.time() + timeout
         while time.time() < deadline:
             _, full = self._read_new()
@@ -161,7 +161,11 @@ class InteractiveSession:
             if f"Opened index {index}" in chunk:
                 self._log_out(chunk, label=f"open {index} success")
                 return "success"
-            if "open:" in chunk.lower() or "No such file" in chunk:
+            low = chunk.lower()
+            if "permission denied" in low or "share.denied" in low:
+                self._log_out(chunk, label=f"open {index} denied")
+                return "denied"
+            if "open:" in low or "No such file" in chunk:
                 self._log_out(chunk, label=f"open {index} error")
                 return "error"
             time.sleep(0.5)
@@ -169,6 +173,16 @@ class InteractiveSession:
         chunk = self._delta(full, before)
         self._log_out(chunk, label=f"open {index} blocked")
         return "blocked"
+
+    def _pid_alive(self):
+        if not self.pid:
+            return False
+        alive, _ = self.client.exec_command(
+            sudo=True,
+            cmd=f"kill -0 {self.pid} 2>/dev/null && echo alive || echo dead",
+            check_ec=False,
+        )
+        return "alive" in (alive or "")
 
     def send(self, line):
         """Write one command line into the FIFO."""
@@ -187,7 +201,7 @@ class InteractiveSession:
         )
 
     def open_file(self, index, mode, timeout=30):
-        """Issue ``open <index> <mode>``. Returns success|blocked|error."""
+        """Issue ``open <index> <mode>``. Returns success|blocked|denied|error."""
         token = OPEN_MODE.get(mode, mode)
         before = self._cat_out()
         self._offset = len(before)
@@ -201,8 +215,7 @@ class InteractiveSession:
     def lock_file(self, index, kind, timeout=15):
         """Issue ``nrlock|nwlock|rlock|wlock <index>``.
 
-        Returns 'success' | 'denied' | 'error' | 'blocked'.
-        Non-blocking locks that conflict return 'denied' (F_SETLK EAGAIN).
+        Returns success|denied|error|blocked.
         """
         before = self._cat_out()
         self._offset = len(before)
@@ -227,27 +240,35 @@ class InteractiveSession:
         self._log_out(chunk, label=f"{kind} {index} blocked")
         return "blocked"
 
-    def stop(self):
-        """Quit/kill helper and remove FIFO/outfile. Safe if start never succeeded.
+    def stop(self, wait_quit_sec=10):
+        """Quit so fds CLOSE; kill only if still alive.
 
-        Sends quit so fds are closed (NFS CLOSE).
+        Do not pkill all common_interactive on the same base — sibling
+        sessions must stay alive.
         """
         c = self.client
         if self.pid:
             try:
                 self.send("quit")
-                time.sleep(1)
             except Exception:
                 pass
-            c.exec_command(
-                sudo=True,
-                cmd=(
-                    f"kill {self.pid} 2>/dev/null; "
-                    f"pkill -f '{REMOTE_BIN} {self.base_prefix}' 2>/dev/null; "
-                    f"pkill -f 'tail -f {self.fifo}' 2>/dev/null; true"
-                ),
-                check_ec=False,
-            )
+            deadline = time.time() + wait_quit_sec
+            while time.time() < deadline and self._pid_alive():
+                time.sleep(0.5)
+            if self._pid_alive():
+                log.warning(
+                    "[interactive:%s] quit timed out; killing pid=%s",
+                    self.tag,
+                    self.pid,
+                )
+                c.exec_command(
+                    sudo=True,
+                    cmd=(
+                        f"kill {self.pid} 2>/dev/null; "
+                        f"pkill -f 'tail -f {self.fifo}' 2>/dev/null; true"
+                    ),
+                    check_ec=False,
+                )
             self.pid = None
         c.exec_command(
             sudo=True,
