@@ -173,10 +173,20 @@ class ShareOpenSession:
                             self.stop()
                             return lock_outcome or "error"
                         if "READY" in text:
+                            if want_deleg and "deleg_stateid=" not in text:
+                                log.warning(
+                                    "[%s] --want-deleg but no deleg_stateid in OPEN",
+                                    self.tag,
+                                )
                             self._holding = True
                             self._log_out(text, label="hold ready")
                             return "success"
                 elif "READY" in text:
+                    if want_deleg and "deleg_stateid=" not in text:
+                        log.warning(
+                            "[%s] --want-deleg but no deleg_stateid in OPEN",
+                            self.tag,
+                        )
                     self._holding = True
                     self._log_out(text, label="hold ready")
                     return "success"

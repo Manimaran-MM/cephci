@@ -10,16 +10,23 @@ Design (all TCs — do not regress):
   2. C2 expect values stay as in WORKFLOWS (solo-TC proven); do not
      retarget success/denied → blocked for pre-grace planting.
 
-Rn0: C1 r deny n; C2 RO+nrlock then close; RW blocked → after open ok.
-Rr0: C1 r deny r; C2 RO denied during grace; after RO denied, WO success.
-Rw0: C1 r deny w; C2 RO+nrlock then close; WO blocked → after WO denied.
-Rb0: C1 r deny b; C2 RO denied during grace; after RO denied, WO denied.
-Wn0: C1 w deny n; C2 RO blocked during grace → after open success.
-Ww0: C1 w deny w; C2 RO blocked during grace → after RO success, WO denied.
-Dn0: C1 rw deny n; C2 RO blocked during grace → after open success.
-DW0: C1 rw deny w; C2 RO blocked during grace → after RO success, WO denied.
-DR0: C1 rw deny r; C2 WO blocked during grace → after WO success, RO denied.
-DB0: C1 rw deny b; C2 RO blocked→denied after grace; WO denied.
+No-deleg (*0):
+Rn0..DB0 — primary export; WANT_NO_DELEG (see WORKFLOWS).
+
+With-deleg (*4 READ / *5 WRITE) on delegations=rw + --want-deleg:
+  Locks under an active deleg are client-local (TSM lock unchanged) until
+  another client's open recalls the deleg — then lock records appear (same
+  as grace_io C13/C14). During C2 RO+nrlock: open+1 lock+0; after recall:
+  after_open_deleg_delta=-1 and optional after_open_lock_delta.
+Rn4: C1 r deny n READ; RO+nrlock close during grace; after grace RW success + recall.
+Rb4: C1 r deny b READ; RO denied; after RO/WO denied (no recall).
+Rw4: C1 r deny w READ; RO+nrlock close; WO denied (share-deny); after WO denied.
+Wn5: C1 w deny n WRITE; RO blocked → after success + recall.
+Ww5: C1 w deny w WRITE; RO blocked → after RO + recall; WO denied.
+Dn5: C1 rw deny n WRITE; RO blocked → after success + recall.
+DW5: C1 rw deny w WRITE; RO blocked → after RO + recall; WO denied.
+DR5: C1 rw deny r WRITE; WO blocked → after WO + recall; RO denied.
+DB5: C1 rw deny b WRITE; RO blocked→denied; WO denied (no recall).
 
 Between TCs: wait NOT IN GRACE → clean close C2/C1 → TSM drain open=0.
 """
@@ -27,10 +34,7 @@ Between TCs: wait NOT IN GRACE → clean close C2/C1 → TSM drain open=0.
 import re
 import time
 
-from cli.ceph.ceph import Ceph
-from cli.utilities.filesys import Mount
 from tests.nfs.lib.common_lib import get_nfs_container_id, get_node_time
-from tests.nfs.lib.multi_active.config import NfsMultiActiveConfig
 from tests.nfs.lib.tsm.grace_hold import (
     GraceCtx,
     hold_cluster_grace,
@@ -41,12 +45,20 @@ from tests.nfs.lib.tsm.grace_hold import (
 from tests.nfs.lib.tsm.helpers import (
     announce,
     check_coredumps,
+    cleanup_grace_suite,
+    close_interactive,
     collect_tsm_node_ids,
+    ensure_deleg_export,
+    file_base,
     fmt_tsm,
     log_workflow_summary,
     mount_clients as _mount_clients,
+    mount_spare_export,
     peer_summary,
+    seed_wf_files,
+    start_spare_hold,
     wait_peer_counts,
+    workflow_peers,
 )
 from tests.nfs.lib.tsm.interactive import (
     InteractiveSession,
@@ -115,7 +127,7 @@ WORKFLOWS = {
     },
     "TC-TSM-G-SD-Rw0": {
         "desc": (
-            "r deny w; C2 RO+nrlock then close; WO blocked during grace; "
+            "r deny w; C2 RO+nrlock then close; WO denied during grace; "
             "after grace WO denied (C1 lease alive)"
         ),
         "c1_access": "r",
@@ -128,7 +140,8 @@ WORKFLOWS = {
                 "lock": "nrlock",
                 "close_after": True,
             },
-            {"mode": WO, "expect": "blocked", "after_expect": "denied"},
+            # deny w → immediate SHARE_DENIED (not grace-blocked).
+            {"mode": WO, "expect": "denied"},
         ],
         "c2_after": [
             {"mode": WO, "expect": "denied"},
@@ -227,11 +240,167 @@ WORKFLOWS = {
             {"mode": WO, "expect": "denied"},
         ],
     },
+    # --- With-deleg (*4 READ / *5 WRITE): same trim as *0 + TSM deleg/recall ---
+    "TC-TSM-G-SD-Rn4": {
+        "desc": (
+            "r deny n READ deleg; C2 RO+nrlock then close during grace; "
+            "after grace RW open success + recall"
+        ),
+        "use_deleg_export": True,
+        "want_deleg": True,
+        "c1_access": "r",
+        "c1_deny": "n",
+        "c2_during": [
+            {
+                "mode": RO,
+                "expect": "success",
+                "lock": "nrlock",
+                "close_after": True,
+            },
+            # RW is after NOT IN GRACE (see c2_after) — not a during-grace hang.
+        ],
+        "c2_after": [
+            {"mode": RW, "expect": "success", "deleg_delta": -1},
+        ],
+    },
+    "TC-TSM-G-SD-Rb4": {
+        "desc": (
+            "r deny b READ deleg; C2 RO denied; after RO/WO denied "
+            "(C1 READ stays, no recall)"
+        ),
+        "use_deleg_export": True,
+        "want_deleg": True,
+        "c1_access": "r",
+        "c1_deny": "b",
+        "c2_during": [
+            {"mode": RO, "expect": "denied"},
+        ],
+        "c2_after": [
+            {"mode": RO, "expect": "denied"},
+            {"mode": WO, "expect": "denied"},
+        ],
+    },
+    "TC-TSM-G-SD-Rw4": {
+        "desc": (
+            "r deny w READ deleg; C2 RO+nrlock then close; WO denied "
+            "(share-deny; after WO denied)"
+        ),
+        "use_deleg_export": True,
+        "want_deleg": True,
+        "c1_access": "r",
+        "c1_deny": "w",
+        "c2_during": [
+            {
+                "mode": RO,
+                "expect": "success",
+                "lock": "nrlock",
+                "close_after": True,
+            },
+            # deny w → immediate SHARE_DENIED (not grace-blocked).
+            {"mode": WO, "expect": "denied"},
+        ],
+        "c2_after": [
+            {"mode": WO, "expect": "denied"},
+        ],
+    },
+    "TC-TSM-G-SD-Wn5": {
+        "desc": (
+            "w deny n WRITE deleg; C2 RO blocked; after RO success + recall"
+        ),
+        "use_deleg_export": True,
+        "want_deleg": True,
+        "c1_access": "w",
+        "c1_deny": "n",
+        "c2_during": [
+            {"mode": RO, "expect": "blocked"},
+        ],
+        "after_open_deleg_delta": -1,
+    },
+    "TC-TSM-G-SD-Ww5": {
+        "desc": (
+            "w deny w WRITE deleg; C2 RO blocked; after RO success + recall; "
+            "WO denied"
+        ),
+        "use_deleg_export": True,
+        "want_deleg": True,
+        "c1_access": "w",
+        "c1_deny": "w",
+        "c2_during": [
+            {"mode": RO, "expect": "blocked"},
+        ],
+        "after_open_deleg_delta": -1,
+        "c2_after": [
+            {"mode": WO, "expect": "denied"},
+        ],
+    },
+    "TC-TSM-G-SD-Dn5": {
+        "desc": (
+            "rw deny n WRITE deleg; C2 RO blocked; after RO success + recall"
+        ),
+        "use_deleg_export": True,
+        "want_deleg": True,
+        "c1_access": "rw",
+        "c1_deny": "n",
+        "c2_during": [
+            {"mode": RO, "expect": "blocked"},
+        ],
+        "after_open_deleg_delta": -1,
+    },
+    "TC-TSM-G-SD-DW5": {
+        "desc": (
+            "rw deny w WRITE deleg; C2 RO blocked; after RO success + recall; "
+            "WO denied"
+        ),
+        "use_deleg_export": True,
+        "want_deleg": True,
+        "c1_access": "rw",
+        "c1_deny": "w",
+        "c2_during": [
+            {"mode": RO, "expect": "blocked"},
+        ],
+        "after_open_deleg_delta": -1,
+        "c2_after": [
+            {"mode": WO, "expect": "denied"},
+        ],
+    },
+    "TC-TSM-G-SD-DR5": {
+        "desc": (
+            "rw deny r WRITE deleg; C2 WO blocked; after WO success + recall; "
+            "RO denied"
+        ),
+        "use_deleg_export": True,
+        "want_deleg": True,
+        "c1_access": "rw",
+        "c1_deny": "r",
+        "c2_during": [
+            {"mode": WO, "expect": "blocked"},
+        ],
+        "after_open_deleg_delta": -1,
+        "c2_after": [
+            {"mode": RO, "expect": "denied"},
+        ],
+    },
+    "TC-TSM-G-SD-DB5": {
+        "desc": (
+            "rw deny b WRITE deleg; C2 RO blocked→denied; WO denied "
+            "(C1 WRITE stays, no recall)"
+        ),
+        "use_deleg_export": True,
+        "want_deleg": True,
+        "c1_access": "rw",
+        "c1_deny": "b",
+        "c2_during": [
+            {"mode": RO, "expect": "blocked", "after_expect": "denied"},
+        ],
+        "c2_after": [
+            {"mode": WO, "expect": "denied"},
+        ],
+    },
 }
 
 
 def _file_base(mount, kind="wf"):
-    return f"{mount.rstrip('/')}/{kind}"
+    return file_base(mount, kind)
 
 
 def _share_filename(idx=WF_FILE_IDX):
@@ -245,58 +414,54 @@ def _stamp(nodes):
 
 
 def _workflow_peers(ctx):
-    peers = list(ctx.peers) if ctx.peers else list(ctx.active[1:])
-    if not ctx.spare_node:
-        return peers
-    return [n for n in peers if n.hostname != ctx.spare_node.hostname]
+    return workflow_peers(ctx)
 
 
 def _seed_wf_file(client, mount, indices=None):
-    if indices is None:
-        indices = [WF_FILE_IDX]
-    for i in indices:
-        path = f"{_file_base(mount)}{i}.txt"
-        client.exec_command(
-            sudo=True,
-            cmd=f"bash -c 'echo seed > {path}; chmod 666 {path}'",
-            check_ec=False,
-        )
+    seed_wf_files(
+        client, mount, indices if indices is not None else [WF_FILE_IDX]
+    )
 
 
 def _close_and_stop(sess, indexes=None, unlock_indexes=None):
-    if not sess:
-        return
-    if indexes is None:
-        indexes = []
-    elif isinstance(indexes, int):
-        indexes = [indexes]
-    unlock_indexes = set(unlock_indexes or [])
-    try:
-        for idx in indexes:
-            if idx in unlock_indexes:
-                sess.send(f"unlock {idx}")
-                time.sleep(1)
-            sess.send(f"close {idx}")
-            time.sleep(1)
-        sess.stop()
-    except Exception as exc:
-        log.warning("interactive close/stop: %s", exc)
+    close_interactive(sess, indexes=indexes, unlock_indexes=unlock_indexes)
 
 
-def _c2_open_check(ctx, client, base, tag, mode, expect, peers, node_id, label):
+def _c2_open_check(
+    ctx,
+    client,
+    base,
+    tag,
+    mode,
+    expect,
+    peers,
+    node_id,
+    label,
+    open_delta=1,
+    lock_delta=0,
+    deleg_delta=None,
+    timeout=30,
+):
     """One-shot C2 open + TSM check + stop. Return 0 ok, 1 fail."""
     open_since = _stamp(peers)
     baseline = peer_summary(peers, ctx.nfs_name, node_id=node_id)
     sess = InteractiveSession(client, base, tag=tag)
     if not sess.start():
         return 1
-    got = sess.open_file(WF_FILE_IDX, mode, timeout=30)
+    got = sess.open_file(WF_FILE_IDX, mode, timeout=timeout)
     if got != expect:
         log.error("[%s] want=%s got=%s", label, expect, got)
         _close_and_stop(sess, indexes=[WF_FILE_IDX] if got == "success" else [])
         return 1
     if _tsm_expect(
-        ctx, baseline, label, open_since, expect == "success", open_delta=1
+        ctx,
+        baseline,
+        label,
+        open_since,
+        expect == "success",
+        open_delta=open_delta,
+        lock_delta=lock_delta,
+        deleg_delta=deleg_delta if expect == "success" else None,
     ):
         _close_and_stop(sess, indexes=[WF_FILE_IDX] if got == "success" else [])
         return 1
@@ -305,11 +470,12 @@ def _c2_open_check(ctx, client, base, tag, mode, expect, peers, node_id, label):
     return 0
 
 
-def _wait_tsm_drained(ctx, label, since=None, timeout=90):
+def _wait_tsm_drained(ctx, label, since=None, timeout=90, expect_deleg=None):
     """Poll peers until Node-id open=0 lock=0 (inter-workflow cleanup gate).
 
     Stamp ``since`` before tearing sessions down so the close-generated
-    ``open=0`` summary is visible. Return 0 ok, 1 timeout.
+    ``open=0`` summary is visible. When ``expect_deleg`` is set (deleg TCs),
+    also wait for that deleg count (usually 0). Return 0 ok, 1 timeout.
     """
     peers = _workflow_peers(ctx)
     node_id = ctx.server_node_id
@@ -320,7 +486,7 @@ def _wait_tsm_drained(ctx, label, since=None, timeout=90):
         since = _stamp(peers)
     announce(
         f"[{label}] wait TSM Node-id {node_id} drain",
-        fmt_tsm(0, 0),
+        fmt_tsm(0, 0, expect_deleg),
     )
     if (
         wait_peer_counts(
@@ -330,6 +496,7 @@ def _wait_tsm_drained(ctx, label, since=None, timeout=90):
             0,
             0,
             label,
+            expect_deleg=expect_deleg,
             timeout=timeout,
             node_id=node_id,
         )
@@ -337,8 +504,9 @@ def _wait_tsm_drained(ctx, label, since=None, timeout=90):
     ):
         snap = peer_summary(peers, ctx.nfs_name, since=since, node_id=node_id)
         log.error(
-            "[%s] TSM drain timeout: want open=0 lock=0 last=%s",
+            "[%s] TSM drain timeout: want open=0 lock=0 deleg=%s last=%s",
             label,
+            expect_deleg,
             snap,
         )
         return 1
@@ -347,67 +515,40 @@ def _wait_tsm_drained(ctx, label, since=None, timeout=90):
 
 
 def _mount_spare(ctx, nfs_version):
-    client = ctx.spare_client
-    out, _ = client.exec_command(
-        sudo=True,
-        cmd=f"mountpoint -q {ctx.spare_mount} && echo ok",
-        check_ec=False,
-    )
-    if "ok" in (out or ""):
-        log.info("Spare already mounted at %s", ctx.spare_mount)
-        return 0
-    try:
-        Ceph(client).nfs.export.create(
-            fs_name="cephfs",
-            nfs_name=ctx.nfs_name,
-            nfs_export=ctx.spare_export,
-            fs="cephfs",
-        )
-    except Exception as exc:
-        log.warning("spare export create: %s (may already exist)", exc)
-    NfsMultiActiveConfig.wait_until_export_visible(
-        client, ctx.nfs_name, ctx.spare_export
-    )
-    client.create_dirs(dir_path=ctx.spare_mount, sudo=True)
-    if Mount(client).nfs(
-        mount=ctx.spare_mount,
-        version=str(nfs_version),
-        port=str(ctx.nfs_port),
-        server=ctx.spare_node.hostname,
-        export=ctx.spare_export,
-    ):
-        log.error("Spare mount failed on %s", client.hostname)
-        return 1
-    return 0
+    return mount_spare_export(ctx, nfs_version)
 
 
 def _start_spare_hold(ctx):
-    if ensure_interactive_binary(ctx.spare_client):
-        return None
-    base = _file_base(ctx.spare_mount, "spare")
-    sess = InteractiveSession(ctx.spare_client, base, tag="spare")
-    if not sess.start():
-        return None
-    if sess.open_file(SPARE_FILE_IDX, "rwc", timeout=30) != "success":
-        log.error("Spare open hold failed")
-        sess.stop()
-        return None
-    log.info("Spare open hold active on %s", ctx.spare_client.hostname)
-    return sess
+    return start_spare_hold(ctx, file_idx=SPARE_FILE_IDX)
 
 
-def _tsm_expect(ctx, baseline, label, since, must_match, open_delta=0, lock_delta=0):
+def _tsm_expect(
+    ctx,
+    baseline,
+    label,
+    since,
+    must_match,
+    open_delta=0,
+    lock_delta=0,
+    deleg_delta=None,
+):
+    """Check Node-id open/lock/(optional deleg) vs baseline+deltas.
+
+    deleg_delta=None → do not assert deleg (*0); int → assert base+delta (*4/*5).
+    """
     peers = _workflow_peers(ctx)
     node_id = ctx.server_node_id
     base_open = int((baseline or {}).get("open", 0))
     base_lock = int((baseline or {}).get("lock", 0))
+    base_deleg = int((baseline or {}).get("deleg", 0))
     want_open = base_open + open_delta
     want_lock = base_lock + lock_delta
+    want_deleg = None if deleg_delta is None else base_deleg + deleg_delta
 
     if must_match:
         announce(
             f"[{label}] validate TSM Node-id {node_id}",
-            fmt_tsm(want_open, want_lock),
+            fmt_tsm(want_open, want_lock, want_deleg),
         )
         if (
             wait_peer_counts(
@@ -417,6 +558,7 @@ def _tsm_expect(ctx, baseline, label, since, must_match, open_delta=0, lock_delt
                 want_open,
                 want_lock,
                 label,
+                expect_deleg=want_deleg,
                 timeout=60,
                 node_id=node_id,
             )
@@ -427,7 +569,7 @@ def _tsm_expect(ctx, baseline, label, since, must_match, open_delta=0, lock_delt
 
     announce(
         f"[{label}] TSM Node-id {node_id} must NOT match "
-        f"{fmt_tsm(want_open if open_delta else base_open, want_lock if lock_delta else base_lock)}"
+        f"{fmt_tsm(want_open if open_delta else base_open, want_lock if lock_delta else base_lock, want_deleg)}"
     )
     time.sleep(2)
     snap = peer_summary(peers, ctx.nfs_name, since=since, node_id=node_id)
@@ -440,11 +582,15 @@ def _tsm_expect(ctx, baseline, label, since, must_match, open_delta=0, lock_delt
     if lock_delta and int(snap.get("lock", 0)) == want_lock:
         log.error("[%s] unexpected TSM lock=%s", label, want_lock)
         return 1
+    if deleg_delta is not None and int(snap.get("deleg", 0)) == want_deleg:
+        log.error("[%s] unexpected TSM deleg=%s", label, want_deleg)
+        return 1
     log.info(
-        "[%s] no TSM bump (open=%s lock=%s) — ok",
+        "[%s] no TSM bump (open=%s lock=%s deleg=%s) — ok",
         label,
         snap.get("open"),
         snap.get("lock"),
+        snap.get("deleg"),
     )
     return 0
 
@@ -490,11 +636,13 @@ def tc_share_deny(ctx, spec, nfs_version="4.2"):
     tag = spec["id"]
     c1_access = spec["c1_access"]
     c1_deny = spec["c1_deny"]
+    use_deleg = bool(spec.get("use_deleg_export"))
+    want_deleg = bool(spec.get("want_deleg"))
+    after_open_deleg_delta = spec.get("after_open_deleg_delta")
+    # Locks held under a live deleg stay client-local until recall.
+    after_open_lock_delta = int(spec.get("after_open_lock_delta") or 0)
     c1 = ctx.client_a
     c2 = ctx.client_b
-    mount = ctx.mount
-    base = _file_base(mount)
-    share_file = _share_filename(WF_FILE_IDX)
 
     if ctx.server_node_id is None:
         log.error("[%s] need server_node_id", tag)
@@ -504,16 +652,37 @@ def tc_share_deny(ctx, spec, nfs_version="4.2"):
     if ensure_interactive_binary(c2):
         return 1
 
-    _seed_wf_file(c1, mount, indices=[WF_FILE_IDX])
-    time.sleep(1)
-    if _mount_spare(ctx, nfs_version):
-        return 1
+    if use_deleg:
+        if ensure_deleg_export(ctx, nfs_version):
+            return 1
+        mount = ctx.deleg_mount
+        export = ctx.deleg_export
+    else:
+        mount = ctx.mount
+        export = ctx.export
+
+    base = _file_base(mount)
+    share_file = _share_filename(WF_FILE_IDX)
 
     peers = _workflow_peers(ctx)
     if not peers:
         log.error("[%s] need ≥1 peer for TSM summary", tag)
         return 1
     node_id = ctx.server_node_id
+
+    # Seed can grant a sticky write-deleg; wait until TSM is clean before grace.
+    if use_deleg:
+        seed_since = _stamp(peers)
+        _seed_wf_file(c1, mount, indices=[WF_FILE_IDX])
+        if _wait_tsm_drained(
+            ctx, f"{tag} post-seed", since=seed_since, expect_deleg=0, timeout=120
+        ):
+            return 1
+    else:
+        _seed_wf_file(c1, mount, indices=[WF_FILE_IDX])
+        time.sleep(1)
+    if _mount_spare(ctx, nfs_version):
+        return 1
 
     c1_sess = None
     c2_ok_sess = None
@@ -537,6 +706,8 @@ def tc_share_deny(ctx, spec, nfs_version="4.2"):
 
         # --- C1 during grace ---
         label = f"{tag} C1 during {c1_access} deny {c1_deny}"
+        if want_deleg:
+            label += " want_deleg"
         announce(f"[{label}] open_share hold expect=success")
         baseline = peer_summary(peers, ctx.nfs_name, node_id=node_id)
         open_since = _stamp(peers)
@@ -544,14 +715,22 @@ def tc_share_deny(ctx, spec, nfs_version="4.2"):
             c1,
             server=ctx.server.hostname,
             port=ctx.nfs_port,
-            export=ctx.export,
+            export=export,
             filename=share_file,
             tag="c1",
         )
-        if c1_sess.open_hold(c1_access, c1_deny) != "success":
+        if c1_sess.open_hold(c1_access, c1_deny, want_deleg=want_deleg) != "success":
             log.error("[%s] C1 open_hold failed", label)
             return 1
-        if _tsm_expect(ctx, baseline, label, open_since, True, open_delta=1):
+        if _tsm_expect(
+            ctx,
+            baseline,
+            label,
+            open_since,
+            True,
+            open_delta=1,
+            deleg_delta=1 if want_deleg else None,
+        ):
             return 1
         log.info("[%s] → success (open_share hold)", label)
 
@@ -592,10 +771,12 @@ def tc_share_deny(ctx, spec, nfs_version="4.2"):
                     blocked_baseline = baseline
                     after_since = _stamp([ctx.server] + peers)
                     log.info(
-                        "[%s] blocked TSM floor open=%s lock=%s after_since=%s",
+                        "[%s] blocked TSM floor open=%s lock=%s deleg=%s "
+                        "after_since=%s",
                         tag,
                         blocked_baseline.get("open"),
                         blocked_baseline.get("lock"),
+                        blocked_baseline.get("deleg"),
                         after_since,
                     )
                 c2_blocked.append(
@@ -622,6 +803,9 @@ def tc_share_deny(ctx, spec, nfs_version="4.2"):
                         _close_and_stop(sess, indexes=[WF_FILE_IDX])
                         return 1
                     c2_ok_unlock = [WF_FILE_IDX]
+                # Under deleg: fcntl succeeds but TSM lock stays 0 until recall
+                # (grace_io _hold_expect). Without deleg: lock bumps TSM.
+                lock_bump = 0 if use_deleg else (1 if lock else 0)
                 if _tsm_expect(
                     ctx,
                     baseline,
@@ -629,7 +813,7 @@ def tc_share_deny(ctx, spec, nfs_version="4.2"):
                     open_since,
                     True,
                     open_delta=1,
-                    lock_delta=1 if lock else 0,
+                    lock_delta=lock_bump,
                 ):
                     _close_and_stop(
                         sess, indexes=[WF_FILE_IDX], unlock_indexes=c2_ok_unlock
@@ -637,13 +821,50 @@ def tc_share_deny(ctx, spec, nfs_version="4.2"):
                     return 1
                 if probe.get("close_after"):
                     announce(f"[{label}] close before next C2 probe")
+                    # Stamp before unlock/close so post-close TSM lines are visible.
+                    # Wait until counts return to the pre-probe floor (C1-only)
+                    # before the next C2 open — under deleg, CLOSE/DELEGRETURN
+                    # can lag and leave open/deleg high for the RW conflict.
+                    close_since = _stamp(peers)
+                    floor_open = int((baseline or {}).get("open", 0))
+                    floor_lock = int((baseline or {}).get("lock", 0))
+                    floor_deleg = (
+                        int((baseline or {}).get("deleg", 0)) if use_deleg else None
+                    )
                     _close_and_stop(
                         sess,
                         indexes=[WF_FILE_IDX],
                         unlock_indexes=c2_ok_unlock,
                     )
                     c2_ok_unlock = []
-                    log.info("[%s] → success (closed)", label)
+                    announce(
+                        f"[{label}] wait TSM back to floor",
+                        fmt_tsm(floor_open, floor_lock, floor_deleg),
+                    )
+                    if (
+                        wait_peer_counts(
+                            peers,
+                            ctx.nfs_name,
+                            close_since,
+                            floor_open,
+                            floor_lock,
+                            f"{label} post-close",
+                            expect_deleg=floor_deleg,
+                            timeout=90,
+                            node_id=node_id,
+                        )
+                        is None
+                    ):
+                        log.error(
+                            "[%s] TSM did not return to floor open=%s lock=%s "
+                            "deleg=%s after close",
+                            label,
+                            floor_open,
+                            floor_lock,
+                            floor_deleg,
+                        )
+                        return 1
+                    log.info("[%s] → success (closed; TSM at floor)", label)
                 else:
                     c2_ok_sess = sess
                     log.info("[%s] → success", label)
@@ -690,6 +911,8 @@ def tc_share_deny(ctx, spec, nfs_version="4.2"):
                     after_since,
                     True,
                     open_delta=n_blocked_success,
+                    lock_delta=after_open_lock_delta,
+                    deleg_delta=after_open_deleg_delta,
                 ):
                     return 1
             else:
@@ -712,8 +935,21 @@ def tc_share_deny(ctx, spec, nfs_version="4.2"):
             expect = probe["expect"]
             label = f"{tag} C2 after {mode}"
             announce(f"[{label}] open expect={expect}")
+            # Recall path (Rn4): longer timeout — may wait on CB_RECALL.
+            timeout = 90 if expect == "success" and probe.get("deleg_delta") else 30
             if _c2_open_check(
-                ctx, c2, base, f"c2a{i}", mode, expect, peers, node_id, label
+                ctx,
+                c2,
+                base,
+                f"c2a{i}",
+                mode,
+                expect,
+                peers,
+                node_id,
+                label,
+                open_delta=1 if expect == "success" else 1,
+                deleg_delta=probe.get("deleg_delta"),
+                timeout=timeout,
             ):
                 return 1
 
@@ -754,8 +990,12 @@ def tc_share_deny(ctx, spec, nfs_version="4.2"):
                 log.info("[%s] C1 open_share CLEAN_CLOSE ok", tag)
             c1_sess = None
         release_cluster_grace(ctx)
+        drain_deleg = 0 if use_deleg else None
         if drain_since is not None and _wait_tsm_drained(
-            ctx, f"{tag} post-cleanup", since=drain_since
+            ctx,
+            f"{tag} post-cleanup",
+            since=drain_since,
+            expect_deleg=drain_deleg,
         ):
             ctx.tsm_drain_failed = True
 
@@ -773,10 +1013,14 @@ def run(ceph_cluster, **kw):
 
     if len(nfs_nodes) < nfs_count:
         log.error("Need ≥%s NFS nodes (have %s)", nfs_count, len(nfs_nodes))
-        return 1
+        return log_workflow_summary(
+            {"precheck": "failed"}, title="TSM GRACE SHARE-DENY SUMMARY"
+        )
     if len(clients) < MIN_CLIENTS:
         log.error("Need ≥%s clients (have %s)", MIN_CLIENTS, len(clients))
-        return 1
+        return log_workflow_summary(
+            {"precheck": "failed"}, title="TSM GRACE SHARE-DENY SUMMARY"
+        )
 
     nodes = nfs_nodes[:nfs_count]
     use_clients = clients[:MIN_CLIENTS]
@@ -786,6 +1030,8 @@ def run(ceph_cluster, **kw):
     mount = f"/mnt/nfs_{name}"
     spare_export = f"/export_{name}_spare"
     spare_mount = f"/mnt/nfs_{name}_spare"
+    deleg_export = f"/export_{name}_deleg"
+    deleg_mount = f"/mnt/nfs_{name}_deleg"
     results = {}
     ctx = None
 
@@ -840,6 +1086,8 @@ def run(ceph_cluster, **kw):
             tsm_port=TSM_PORT,
             tsm_node_ids=tsm_node_ids,
         )
+        ctx.deleg_export = deleg_export
+        ctx.deleg_mount = deleg_mount
 
         cases = selected or list(WORKFLOWS.keys())
         _, coredump_since = get_node_time(nodes)
@@ -886,26 +1134,8 @@ def run(ceph_cluster, **kw):
         if not results:
             results["suite"] = "failed"
     finally:
-        if ctx:
-            release_cluster_grace(ctx)
-            if ctx.spare_client and ctx.spare_mount:
-                ctx.spare_client.exec_command(
-                    sudo=True,
-                    cmd=f"umount -l {ctx.spare_mount} 2>/dev/null",
-                    check_ec=False,
-                )
-                try:
-                    Ceph(ctx.spare_client).nfs.export.delete(
-                        ctx.nfs_name, ctx.spare_export
-                    )
-                except Exception as exc:
-                    log.warning("spare export delete: %s", exc)
-        for client in use_clients:
-            client.exec_command(
-                sudo=True,
-                cmd=f"umount -l {mount} 2>/dev/null",
-                check_ec=False,
-            )
-        safe_cleanup(use_clients[0], mount, nfs_name, export, nodes)
+        cleanup_grace_suite(
+            ctx, use_clients, mount, nfs_name, export, nodes, safe_cleanup
+        )
 
     return log_workflow_summary(results, title="TSM GRACE SHARE-DENY SUMMARY")
