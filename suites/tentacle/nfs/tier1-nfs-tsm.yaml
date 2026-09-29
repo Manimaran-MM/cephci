@@ -206,27 +206,34 @@ tests:
   #       TC-TSM-G-C21 - IBMCEPH-19165, IBMCEPH-18586
   #       TC-TSM-G-C22 - IBMCEPH-19165, IBMCEPH-18586
 
-  # - test:
-  #     name: NFS TSM - Grace recover (primary restart)
-  #     module: tsm.test_nfs_tsm_grace_io.py
-  #     desc: Primary restart chain R01–R06; sticky reclaim, grace opens, write-deleg conflict
-  #     abort-on-fail: false
-  #     config:
-  #       nfs_version: "4.2"
-  #       nfs_count: 4
+  - test:
+      name: NFS TSM - Grace recover (primary restart)
+      module: tsm.test_nfs_tsm_grace_io.py
+      desc: Primary restart chain R01–R06; sticky reclaim, grace opens, write-deleg conflict
+      abort-on-fail: false
+      config:
+        nfs_version: "4.2"
+        nfs_count: 4
   #       workflows: ["TC-TSM-G-R01"]
 
   - test:
-      name: NFS TSM - Grace share-deny (Dn0-DW0-DR0-DB0)
+      name: NFS TSM - Grace share-deny (Rn4-DB5)
       module: tsm.test_nfs_tsm_grace_share_deny.py
-      desc: Share-deny Dn0/DW0/DR0/DB0 (rw deny n/w/r/b)
+      desc: Share-deny with-deleg Rn4/Rb4/Rw4 + Wn5..DB5 (delegations=rw)
       abort-on-fail: false
       config:
         nfs_version: "4.2"
         nfs_count: 4
         # workflows:
-        #   - "TC-TSM-G-SD-Rn0"
-        #   - "TC-TSM-G-SD-Rr0"
+        #   - "TC-TSM-G-SD-Rn4"
+        #   - "TC-TSM-G-SD-Rb4"
+        #   - "TC-TSM-G-SD-Rw4"
+        #   - "TC-TSM-G-SD-Wn5"
+        #   - "TC-TSM-G-SD-Ww5"
+        #   - "TC-TSM-G-SD-Dn5"
+        #   - "TC-TSM-G-SD-DW5"
+        #   - "TC-TSM-G-SD-DR5"
+        #   - "TC-TSM-G-SD-DB5"
 
   # - test:
   #     name: NFS TSM - Integration

@@ -38,10 +38,7 @@ R01–R06 chain: keep fds across primary restarts; cumulative reclaim then
 import re
 import time
 
-from cli.ceph.ceph import Ceph
-from cli.utilities.filesys import Mount
 from tests.nfs.lib.common_lib import get_nfs_container_id, get_node_time
-from tests.nfs.lib.multi_active.config import NfsMultiActiveConfig
 from tests.nfs.lib.tsm.grace_hold import (
     GraceCtx,
     enter_grace,
@@ -54,12 +51,20 @@ from tests.nfs.lib.tsm.grace_hold import (
 from tests.nfs.lib.tsm.helpers import (
     announce,
     check_coredumps,
+    cleanup_grace_suite,
+    close_interactive,
     collect_tsm_node_ids,
+    ensure_deleg_export,
+    file_base,
     fmt_tsm,
     log_workflow_summary,
     mount_clients as _mount_clients,
+    mount_spare_export,
     peer_summary,
+    seed_wf_files,
+    start_spare_hold,
     wait_peer_counts,
+    workflow_peers,
 )
 from tests.nfs.lib.tsm.interactive import (
     InteractiveSession,
@@ -423,49 +428,22 @@ WORKFLOWS = {
 
 
 def _file_base(mount, kind="wf"):
-    return f"{mount.rstrip('/')}/{kind}"
+    return file_base(mount, kind)
 
 
 def _seed_wf_file(client, mount, indices=None):
     """Create wf{i}.txt for each index (needed for O_RDONLY/O_WRONLY/O_RDWR)."""
-    if indices is None:
-        indices = [WF_FILE_IDX]
-    for i in indices:
-        path = f"{_file_base(mount)}{i}.txt"
-        client.exec_command(
-            sudo=True,
-            cmd=f"bash -c 'echo seed > {path}; chmod 666 {path}'",
-            check_ec=False,
-        )
+    seed_wf_files(client, mount, indices if indices is not None else [WF_FILE_IDX])
 
 
 def _workflow_peers(ctx):
     """Peers for TSM summary (exclude spare under partition)."""
-    peers = list(ctx.peers) if ctx.peers else list(ctx.active[1:])
-    if not ctx.spare_node:
-        return peers
-    return [n for n in peers if n.hostname != ctx.spare_node.hostname]
+    return workflow_peers(ctx)
 
 
 def _close_and_stop(sess, indexes=None, unlock_indexes=None):
     """Close held indexes (optional unlock first), then stop the session."""
-    if not sess:
-        return
-    if indexes is None:
-        indexes = []
-    elif isinstance(indexes, int):
-        indexes = [indexes]
-    unlock_indexes = set(unlock_indexes or [])
-    try:
-        for idx in indexes:
-            if idx in unlock_indexes:
-                sess.send(f"unlock {idx}")
-                time.sleep(1)
-            sess.send(f"close {idx}")
-            time.sleep(1)
-        sess.stop()
-    except Exception as exc:
-        log.warning("interactive close/stop: %s", exc)
+    close_interactive(sess, indexes=indexes, unlock_indexes=unlock_indexes)
 
 
 def _backdate_since(since, skew_sec):
@@ -617,124 +595,12 @@ def _accept_grace_exited_open(
 
 def _mount_spare(ctx, nfs_version):
     """Create spare export + mount once; reuse across TCs if still mounted."""
-    client = ctx.spare_client
-    out, _ = client.exec_command(
-        sudo=True,
-        cmd=f"mountpoint -q {ctx.spare_mount} && echo ok",
-        check_ec=False,
-    )
-    if "ok" in (out or ""):
-        log.info("Spare already mounted at %s — skip export/subvolume", ctx.spare_mount)
-        return 0
-
-    try:
-        Ceph(client).nfs.export.create(
-            fs_name="cephfs",
-            nfs_name=ctx.nfs_name,
-            nfs_export=ctx.spare_export,
-            fs="cephfs",
-        )
-    except Exception as exc:
-        log.warning("spare export create: %s (may already exist)", exc)
-    NfsMultiActiveConfig.wait_until_export_visible(
-        client, ctx.nfs_name, ctx.spare_export
-    )
-    client.create_dirs(dir_path=ctx.spare_mount, sudo=True)
-    if Mount(client).nfs(
-        mount=ctx.spare_mount,
-        version=str(nfs_version),
-        port=str(ctx.nfs_port),
-        server=ctx.spare_node.hostname,
-        export=ctx.spare_export,
-    ):
-        log.error("Spare mount failed on %s", client.hostname)
-        return 1
-    return 0
+    return mount_spare_export(ctx, nfs_version)
 
 
 def _start_spare_hold(ctx):
     """Open-hold spare0.txt via common_interactive (rwc)."""
-    if ensure_interactive_binary(ctx.spare_client):
-        return None
-    base = _file_base(ctx.spare_mount, "spare")
-    sess = InteractiveSession(ctx.spare_client, base, tag="spare")
-    if not sess.start():
-        return None
-    if sess.open_file(SPARE_FILE_IDX, "rwc", timeout=30) != "success":
-        log.error("Spare open hold failed on %s%s.txt", base, SPARE_FILE_IDX)
-        sess.stop()
-        return None
-    log.info(
-        "Spare open hold active on %s (%s%s.txt)",
-        ctx.spare_client.hostname,
-        base,
-        SPARE_FILE_IDX,
-    )
-    return sess
-
-
-def _ensure_deleg_export(ctx, nfs_version):
-    """Create primary-style export with delegations=rw; mount on workflow clients once."""
-    if getattr(ctx, "_deleg_ready", False):
-        return 0
-    if not ctx.deleg_export or not ctx.deleg_mount:
-        log.error("ctx.deleg_export / ctx.deleg_mount not set")
-        return 1
-
-    client = ctx.client_a
-    announce(f"Create/mount deleg export {ctx.deleg_export} (delegations=rw)")
-    try:
-        Ceph(client).nfs.export.create(
-            fs_name="cephfs",
-            nfs_name=ctx.nfs_name,
-            nfs_export=ctx.deleg_export,
-            fs="cephfs",
-        )
-    except Exception as exc:
-        log.warning("deleg export create: %s (may already exist)", exc)
-    # Set export-level delegations=rw (ceph CLI on client; same as other grace cmds)
-    try:
-        client.exec_command(
-            sudo=True,
-            cmd=f"ceph nfs export update {ctx.nfs_name} {ctx.deleg_export} rw",
-        )
-    except Exception as exc:
-        log.error("set delegations=rw on %s failed: %s", ctx.deleg_export, exc)
-        return 1
-    out, _ = client.exec_command(
-        sudo=True,
-        cmd=f"ceph nfs export info {ctx.nfs_name} {ctx.deleg_export} -f json",
-        check_ec=False,
-    )
-    if "rw" not in (out or "").lower():
-        log.warning(
-            "delegations=rw not confirmed in export info (got %r); continuing",
-            (out or "")[:200],
-        )
-    NfsMultiActiveConfig.wait_until_export_visible(
-        client, ctx.nfs_name, ctx.deleg_export
-    )
-    for c in ctx.clients:
-        c.create_dirs(dir_path=ctx.deleg_mount, sudo=True)
-        out, _ = c.exec_command(
-            sudo=True,
-            cmd=f"mountpoint -q {ctx.deleg_mount} && echo ok",
-            check_ec=False,
-        )
-        if "ok" in (out or ""):
-            continue
-        if Mount(c).nfs(
-            mount=ctx.deleg_mount,
-            version=str(nfs_version),
-            port=str(ctx.nfs_port),
-            server=ctx.server.hostname,
-            export=ctx.deleg_export,
-        ):
-            log.error("Deleg mount failed on %s", c.hostname)
-            return 1
-    ctx._deleg_ready = True
-    log.info("Deleg export ready: %s -> %s", ctx.deleg_export, ctx.deleg_mount)
-    return 0
+    return start_spare_hold(ctx, file_idx=SPARE_FILE_IDX)
 
 
 def _validate_conflict_logs(ctx, c1_mode, c2_mode, since, label):
@@ -918,7 +784,7 @@ def tc_conflict_generic(ctx, spec, nfs_version="4.2"):
         return 1
 
     if use_deleg:
-        if _ensure_deleg_export(ctx, nfs_version):
+        if ensure_deleg_export(ctx, nfs_version):
             return 1
         mount = ctx.deleg_mount
     else:
@@ -960,6 +826,7 @@ def tc_conflict_generic(ctx, spec, nfs_version="4.2"):
     c1_unlock_idxs = []
     c2_close_idxs = [WF_FILE_IDX]
     c2_unlock_idxs = []
+    grace_since = None
     # Share-access for conflict logs: pre-grace open when C1 skips during-grace open
     conflict_existing_mode = pre_mode if (skip_c1_during and pre_mode) else c1_mode
     try:
@@ -1170,6 +1037,14 @@ def tc_conflict_generic(ctx, spec, nfs_version="4.2"):
         log.info("[%s] PASSED", tag)
         return 0
     finally:
+        # Always end grace before CLOSE (even if try returned early).
+        try:
+            unblock_cluster_grace(ctx)
+            if grace_since is not None:
+                if wait_grace_exit(ctx, grace_since, timeout=150):
+                    log.warning("[%s] grace exit wait timed out before close", tag)
+        except Exception as exc:
+            log.warning("[%s] unblock/wait grace before close: %s", tag, exc)
         unlock_c2 = list(c2_unlock_idxs) if c2_held_lock or c2_unlock_idxs else []
         _close_and_stop(
             c2_sess,
@@ -1250,6 +1125,7 @@ def tc_recover_primary(ctx, spec, nfs_version="4.2"):
     c1d_unlock_idxs = []
     c2d_close_idxs = []
     c2d_unlock_idxs = []
+    grace_since = None
     try:
         if not ctx.server:
             log.error("[%s] need primary server for TSM scrape", tag)
@@ -1407,7 +1283,7 @@ def tc_recover_primary(ctx, spec, nfs_version="4.2"):
                         f"[{tag} {aname}] write-deleg plant then conflict "
                         f"(floor {fmt_tsm(floor_open, floor_lock, floor_deleg or 0)})"
                     )
-                    if _ensure_deleg_export(ctx, nfs_version):
+                    if ensure_deleg_export(ctx, nfs_version):
                         return 1
                     # Seed can leave sticky write-deleg; wait until TSM is back
                     # at the R05 floor before the hang plant open.
@@ -1742,6 +1618,13 @@ def tc_recover_primary(ctx, spec, nfs_version="4.2"):
         log.info("[%s] PASSED (phases %s)", tag, [p["name"] for p in phases])
         return 0
     finally:
+        try:
+            unblock_cluster_grace(ctx)
+            if grace_since is not None:
+                if wait_grace_exit(ctx, grace_since, timeout=150):
+                    log.warning("[%s] grace exit wait timed out before close", tag)
+        except Exception as exc:
+            log.warning("[%s] unblock/wait grace before close: %s", tag, exc)
         _close_and_stop(
             c2d_sess,
             indexes=c2d_close_idxs,
@@ -1804,10 +1687,14 @@ def run(ceph_cluster, **kw):
 
     if len(nfs_nodes) < nfs_count:
         log.error("Need ≥%s NFS nodes (have %s)", nfs_count, len(nfs_nodes))
-        return 1
+        return log_workflow_summary(
+            {"precheck": "failed"}, title="TSM GRACE IO SUMMARY"
+        )
     if len(clients) < MIN_CLIENTS:
         log.error("Need ≥%s clients (have %s)", MIN_CLIENTS, len(clients))
-        return 1
+        return log_workflow_summary(
+            {"precheck": "failed"}, title="TSM GRACE IO SUMMARY"
+        )
 
     nodes = nfs_nodes[:nfs_count]
     use_clients = clients[:MIN_CLIENTS]
@@ -1919,41 +1806,8 @@ def run(ceph_cluster, **kw):
         if not results:
             results["suite"] = "failed"
     finally:
-        if ctx:
-            release_cluster_grace(ctx)
-            if ctx.spare_client and ctx.spare_mount:
-                ctx.spare_client.exec_command(
-                    sudo=True,
-                    cmd=f"umount -l {ctx.spare_mount} 2>/dev/null",
-                    check_ec=False,
-                )
-                try:
-                    Ceph(ctx.spare_client).nfs.export.delete(
-                        ctx.nfs_name, ctx.spare_export
-                    )
-                except Exception as exc:
-                    log.warning("spare export delete: %s", exc)
-            if getattr(ctx, "_deleg_ready", False) and ctx.deleg_mount:
-                for c in ctx.clients:
-                    c.exec_command(
-                        sudo=True,
-                        cmd=f"umount -l {ctx.deleg_mount} 2>/dev/null",
-                        check_ec=False,
-                    )
-                try:
-                    Ceph(ctx.client_a).nfs.export.delete(
-                        ctx.nfs_name, ctx.deleg_export
-                    )
-                except Exception as exc:
-                    log.warning("deleg export delete: %s", exc)
-        # Unmount all clients before NFS cluster delete (safe_cleanup only
-        # umounts use_clients[0]).
-        for client in use_clients:
-            client.exec_command(
-                sudo=True,
-                cmd=f"umount -l {mount} 2>/dev/null",
-                check_ec=False,
-            )
-        safe_cleanup(use_clients[0], mount, nfs_name, export, nodes)
+        cleanup_grace_suite(
+            ctx, use_clients, mount, nfs_name, export, nodes, safe_cleanup
+        )
 
     return log_workflow_summary(results, title="TSM GRACE IO SUMMARY")

@@ -224,6 +224,209 @@ def mount_clients(clients, nfs_name, export, mount, nfs_port, server, nfs_versio
     return 0
 
 
+def ensure_deleg_export(ctx, nfs_version="4.2"):
+    """Create/mount ``ctx.deleg_export`` with ``delegations=rw`` once.
+
+    Requires ``ctx.deleg_export``, ``ctx.deleg_mount``, ``ctx.clients``,
+    ``ctx.nfs_name``, ``ctx.nfs_port``, ``ctx.server``. Return 0 ok, 1 fail.
+    """
+    if getattr(ctx, "_deleg_ready", False):
+        return 0
+    if not getattr(ctx, "deleg_export", None) or not getattr(ctx, "deleg_mount", None):
+        log.error("ctx.deleg_export / ctx.deleg_mount not set")
+        return 1
+
+    client = ctx.client_a
+    announce(f"Create/mount deleg export {ctx.deleg_export} (delegations=rw)")
+    try:
+        Ceph(client).nfs.export.create(
+            fs_name="cephfs",
+            nfs_name=ctx.nfs_name,
+            nfs_export=ctx.deleg_export,
+            fs="cephfs",
+        )
+    except Exception as exc:
+        log.warning("deleg export create: %s (may already exist)", exc)
+    try:
+        client.exec_command(
+            sudo=True,
+            cmd=f"ceph nfs export update {ctx.nfs_name} {ctx.deleg_export} rw",
+        )
+    except Exception as exc:
+        log.error("set delegations=rw on %s failed: %s", ctx.deleg_export, exc)
+        return 1
+    out, _ = client.exec_command(
+        sudo=True,
+        cmd=f"ceph nfs export info {ctx.nfs_name} {ctx.deleg_export} -f json",
+        check_ec=False,
+    )
+    if "rw" not in (out or "").lower():
+        log.warning(
+            "delegations=rw not confirmed in export info (got %r); continuing",
+            (out or "")[:200],
+        )
+    NfsMultiActiveConfig.wait_until_export_visible(
+        client, ctx.nfs_name, ctx.deleg_export
+    )
+    for c in ctx.clients:
+        c.create_dirs(dir_path=ctx.deleg_mount, sudo=True)
+        out, _ = c.exec_command(
+            sudo=True,
+            cmd=f"mountpoint -q {ctx.deleg_mount} && echo ok",
+            check_ec=False,
+        )
+        if "ok" in (out or ""):
+            continue
+        if Mount(c).nfs(
+            mount=ctx.deleg_mount,
+            version=str(nfs_version),
+            port=str(ctx.nfs_port),
+            server=ctx.server.hostname,
+            export=ctx.deleg_export,
+        ):
+            log.error("Deleg mount failed on %s", c.hostname)
+            return 1
+    ctx._deleg_ready = True
+    log.info("Deleg export ready: %s -> %s", ctx.deleg_export, ctx.deleg_mount)
+    return 0
+
+
+def file_base(mount, kind="wf"):
+    """Path prefix for interactive/open_share files: ``{mount}/{kind}``."""
+    return f"{mount.rstrip('/')}/{kind}"
+
+
+def seed_wf_files(client, mount, indices, kind="wf"):
+    """Create ``{kind}{i}.txt`` for each index (seed content, mode 666)."""
+    for i in indices:
+        path = f"{file_base(mount, kind)}{i}.txt"
+        client.exec_command(
+            sudo=True,
+            cmd=f"bash -c 'echo seed > {path}; chmod 666 {path}'",
+            check_ec=False,
+        )
+
+
+def workflow_peers(ctx):
+    """Peers for TSM scrape (exclude spare while partitioned)."""
+    peers = list(ctx.peers) if ctx.peers else list(ctx.active[1:])
+    if not ctx.spare_node:
+        return peers
+    return [n for n in peers if n.hostname != ctx.spare_node.hostname]
+
+
+def close_interactive(sess, indexes=None, unlock_indexes=None):
+    """Unlock/close held indexes then stop InteractiveSession. No-op if None."""
+    if not sess:
+        return
+    if indexes is None:
+        indexes = []
+    elif isinstance(indexes, int):
+        indexes = [indexes]
+    unlock_indexes = set(unlock_indexes or [])
+    try:
+        for idx in indexes:
+            if idx in unlock_indexes:
+                sess.send(f"unlock {idx}")
+                time.sleep(1)
+            sess.send(f"close {idx}")
+            time.sleep(1)
+        sess.stop()
+    except Exception as exc:
+        log.warning("interactive close/stop: %s", exc)
+
+
+def mount_spare_export(ctx, nfs_version="4.2"):
+    """Create/mount spare export once. Return 0 ok, 1 fail."""
+    client = ctx.spare_client
+    out, _ = client.exec_command(
+        sudo=True,
+        cmd=f"mountpoint -q {ctx.spare_mount} && echo ok",
+        check_ec=False,
+    )
+    if "ok" in (out or ""):
+        log.info("Spare already mounted at %s", ctx.spare_mount)
+        return 0
+    try:
+        Ceph(client).nfs.export.create(
+            fs_name="cephfs",
+            nfs_name=ctx.nfs_name,
+            nfs_export=ctx.spare_export,
+            fs="cephfs",
+        )
+    except Exception as exc:
+        log.warning("spare export create: %s (may already exist)", exc)
+    NfsMultiActiveConfig.wait_until_export_visible(
+        client, ctx.nfs_name, ctx.spare_export
+    )
+    client.create_dirs(dir_path=ctx.spare_mount, sudo=True)
+    if Mount(client).nfs(
+        mount=ctx.spare_mount,
+        version=str(nfs_version),
+        port=str(ctx.nfs_port),
+        server=ctx.spare_node.hostname,
+        export=ctx.spare_export,
+    ):
+        log.error("Spare mount failed on %s", client.hostname)
+        return 1
+    return 0
+
+
+def start_spare_hold(ctx, file_idx=0):
+    """Open-hold ``spare{file_idx}.txt`` via InteractiveSession. Return sess or None."""
+    from tests.nfs.lib.tsm.interactive import (
+        InteractiveSession,
+        ensure_interactive_binary,
+    )
+
+    if ensure_interactive_binary(ctx.spare_client):
+        return None
+    base = file_base(ctx.spare_mount, "spare")
+    sess = InteractiveSession(ctx.spare_client, base, tag="spare")
+    if not sess.start():
+        return None
+    if sess.open_file(file_idx, "rwc", timeout=30) != "success":
+        log.error("Spare open hold failed")
+        sess.stop()
+        return None
+    log.info("Spare open hold active on %s", ctx.spare_client.hostname)
+    return sess
+
+
+def cleanup_grace_suite(ctx, clients, mount, nfs_name, export, nodes, safe_cleanup_fn):
+    """Suite finally: release grace hold, umount spare/deleg/primary, delete cluster."""
+    from tests.nfs.lib.tsm.grace_hold import release_cluster_grace
+
+    if ctx:
+        release_cluster_grace(ctx)
+        if ctx.spare_client and ctx.spare_mount:
+            ctx.spare_client.exec_command(
+                sudo=True,
+                cmd=f"umount -l {ctx.spare_mount} 2>/dev/null",
+                check_ec=False,
+            )
+            try:
+                Ceph(ctx.spare_client).nfs.export.delete(ctx.nfs_name, ctx.spare_export)
+            except Exception as exc:
+                log.warning("spare export delete: %s", exc)
+        if getattr(ctx, "_deleg_ready", False) and ctx.deleg_mount:
+            for c in ctx.clients:
+                c.exec_command(
+                    sudo=True,
+                    cmd=f"umount -l {ctx.deleg_mount} 2>/dev/null",
+                    check_ec=False,
+                )
+            try:
+                Ceph(ctx.client_a).nfs.export.delete(ctx.nfs_name, ctx.deleg_export)
+            except Exception as exc:
+                log.warning("deleg export delete: %s", exc)
+    for client in clients:
+        client.exec_command(
+            sudo=True, cmd=f"umount -l {mount} 2>/dev/null", check_ec=False
+        )
+    safe_cleanup_fn(clients[0], mount, nfs_name, export, nodes)
+
+
 def fmt_tsm(open_c, lock_c, deleg_c=None):
     """Format open/lock/(optional deleg) for banners and errors."""
     if deleg_c is None:
