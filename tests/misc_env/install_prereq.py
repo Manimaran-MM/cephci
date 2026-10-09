@@ -239,6 +239,10 @@ def install_prereq(
         # Restarting the node for qdisc filter to be loaded. This is required for
         # RHEL-8
         if not distro_ver.startswith("7"):
+            # CDN may install an older kernel-core via kernel-modules-extra and make it
+            # the next default; prefer the newest already-installed kernel before reboot.
+            set_latest_installed_kernel_default(ceph)
+
             # Avoiding early channel close and ignoring channel exception thrown during
             # reboot
             time.sleep(10)
@@ -617,6 +621,31 @@ def update_iptables(node):
                 node.exec_command(cmd=f"$(which iptables) -D {rule}", sudo=True)
     except Exception as err:
         log.error(f"iptables rpm do not exist... error : {err}")
+
+
+def set_latest_installed_kernel_default(ceph):
+    """
+    Set grubby default to the newest installed kernel-core on the node.
+
+    CDN package installs can register an older kernel as the next boot default.
+    Prefer the highest installed NEVRA so the subsequent reboot uses the newest
+    kernel already present on disk (e.g. from the cloud image).
+    """
+    cmd = (
+        "rpm -q kernel-core --qf '%{VERSION}-%{RELEASE}.%{ARCH}\\n' "
+        "| sort -V | tail -1"
+    )
+    latest, _ = ceph.exec_command(sudo=True, cmd=cmd)
+    latest = latest.strip()
+    if not latest or "not installed" in latest.lower():
+        raise ConfigError(
+            f"{ceph.hostname}: no kernel-core package found to set as default"
+        )
+
+    vmlinuz_path = f"/boot/vmlinuz-{latest}"
+    ceph.exec_command(sudo=True, cmd=f"test -e {vmlinuz_path}")
+    log.info(f"{ceph.hostname}: setting default kernel to {vmlinuz_path}")
+    ceph.exec_command(sudo=True, cmd=f"grubby --set-default {vmlinuz_path}")
 
 
 def workaround_openssl_issue(node) -> None:
