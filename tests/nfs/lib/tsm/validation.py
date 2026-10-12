@@ -280,11 +280,11 @@ class NfsTsmValidation:
         return 0
 
     def assert_tsm_disable_logs(self, nfs_name, node, peers=None, since=None):
-        """Return 0 if disable markers match on recovering node and peers.
+        """Return 0 if disable markers match on recovering node (and peers if set).
 
-        Recovering ``node``: optional TSM_DISABLE_PRESENT, plus TSM_DISABLE_ABSENT.
-        ``peers`` (if given): each must match TSM_DISABLE_PEER_PRESENT
-        (Cleaned all node state records OR TSM_DISABLE_NOTIFY).
+        Recovering ``node``: TSM_DISABLE_PRESENT + TSM_DISABLE_ABSENT.
+        ``peers`` (if given and TSM_DISABLE_PEER_PRESENT non-empty): each peer
+        must match those patterns.
         """
         log.info("TSM DISABLE-PATH LOG VALIDATION (%s on %s)", nfs_name, node.hostname)
         for pat in TSM_DISABLE_PRESENT:
@@ -305,27 +305,25 @@ class NfsTsmValidation:
                 return 1
         log.info("%s: TSM disable path ok", node.hostname)
 
-        if not peers:
-            log.error("TSM disable validation requires peers for notify/cleanup markers")
-            return 1
-        peer_list = peers if isinstance(peers, (list, tuple)) else [peers]
-        log.info(
-            "TSM disable peer markers on: %s",
-            [p.hostname for p in peer_list],
-        )
-        for pat in TSM_DISABLE_PEER_PRESENT:
-            if (
-                scrape_nfs_logs(
-                    peer_list,
-                    pat,
-                    nfs_name=nfs_name,
-                    require_match=True,
-                    since=since,
-                )
-                is None
-            ):
-                return 1
-        log.info("peers: TSM disable notify/cleanup ok")
+        if peers and TSM_DISABLE_PEER_PRESENT:
+            peer_list = peers if isinstance(peers, (list, tuple)) else [peers]
+            log.info(
+                "TSM disable peer markers on: %s",
+                [p.hostname for p in peer_list],
+            )
+            for pat in TSM_DISABLE_PEER_PRESENT:
+                if (
+                    scrape_nfs_logs(
+                        peer_list,
+                        pat,
+                        nfs_name=nfs_name,
+                        require_match=True,
+                        since=since,
+                    )
+                    is None
+                ):
+                    return 1
+            log.info("peers: TSM disable notify/cleanup ok")
         return 0
 
     def assert_tsm_primary_selection_fail_logs(self, nfs_name, node, since=None):

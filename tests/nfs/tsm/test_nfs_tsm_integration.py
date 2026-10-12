@@ -10,6 +10,8 @@ from tests.nfs.lib.tsm.constants import NfsFcntlLock
 from tests.nfs.lib.tsm.helpers import (
     announce,
     check_coredumps,
+    collect_tsm_node_ids,
+    get_host_tsm_node_id,
     kill_holds,
     log_workflow_summary,
     peer_summary,
@@ -108,6 +110,8 @@ class IntegCtx:
         self.active = active
         self.server = active[0]
         self.peers = active[1:]
+        # Clients mount this host; never reassign from "first active" after reboot/rm.
+        self.mount_hostname = active[0].hostname
         self.nfs_name = NFS_NAME
         self.nfs_port = nfs_port
         self.nfs_version = nfs_version
@@ -121,16 +125,35 @@ class IntegCtx:
         self.ganesha_id = None
         self.mds_pre = []
         self.disrupt_since = None
+        # TC-04/05/06/09: post checks peer Node-ids == 0 and mount server retains baseline.
+        self.peer_disrupt_post = False
+        # hostname → TSM Node-id, captured once after deploy (stable across disrupt).
+        self.tsm_node_ids = {}
+        # Mount-server TSM Node-id (baseline open/lock/deleg live here, not on peer ids).
+        self.server_nid = None
         self.all_nfs_nodes = []
         self.validator = NfsTsmValidation(ceph_cluster, clients[0], "enable_TSM", "Tsm_Port", TSM_PORT)
 
 
 def _refresh_active(ctx):
+    """Refresh running NFS nodes; keep mount server identity pinned."""
     active = nodes_running_nfs(ctx.pool_nodes, ctx.nfs_name)
-    if active:
-        ctx.active = active
+    if not active:
+        return active
+    ctx.active = active
+    mount_hn = ctx.mount_hostname or (ctx.server.hostname if ctx.server else None)
+    if mount_hn:
+        # Prefer the pinned mount host even if its container is briefly down.
+        server = next((n for n in ctx.pool_nodes if n.hostname == mount_hn), None)
+        if server is None:
+            server = next((n for n in active if n.hostname == mount_hn), None)
+        if server is not None:
+            ctx.server = server
+        ctx.peers = [n for n in active if n.hostname != mount_hn]
+    else:
         ctx.server = active[0]
         ctx.peers = active[1:]
+        ctx.mount_hostname = ctx.server.hostname
     return active
 
 
@@ -178,6 +201,12 @@ def deploy_shared_cluster(ceph_cluster, installer, clients, nfs_nodes, config):
     enable_nfs_debug_logs(clients[0], NFS_NAME, "TSM")
     _refresh_active(ctx)
     time.sleep(DEPLOY_SETTLE_SEC)
+    announce("Collect TSM Node-ids from podman logs (Ganesha ID)")
+    ctx.tsm_node_ids = collect_tsm_node_ids(ctx.active, NFS_NAME)
+    if len(ctx.tsm_node_ids) < len(ctx.active):
+        missing = [n.hostname for n in ctx.active if n.hostname not in ctx.tsm_node_ids]
+        return _deploy_fail(f"Missing TSM Node-id for: {missing}", clients, pool, ctx)
+    ctx.server_nid = ctx.tsm_node_ids.get(ctx.server.hostname)
     ctx.ganesha_id = record_ganesha_id(ctx.cmd, ctx.nfs_name)
     return ctx
 
@@ -206,6 +235,9 @@ def _prepare_tc10_placement(ctx):
         return False
     ctx.pool_nodes = pool_nodes
     _refresh_active(ctx)
+    # Placement may move daemons; refresh Node-id map for current active set.
+    ctx.tsm_node_ids.update(collect_tsm_node_ids(ctx.active, ctx.nfs_name))
+    ctx.server_nid = ctx.tsm_node_ids.get(ctx.server.hostname, ctx.server_nid)
     ctx.ganesha_id = record_ganesha_id(ctx.cmd, ctx.nfs_name)
     return True
 
@@ -222,10 +254,82 @@ def _start_one_hold(ctx, index):
     return (client, pid) if pid else None
 
 
+def _nid_for(ctx, node, label):
+    """Return stable TSM Node-id for node from post-deploy map (grace-io style)."""
+    nid = ctx.tsm_node_ids.get(node.hostname)
+    if nid is not None:
+        return nid
+    # Fallback live scrape only if map missed this host (e.g. TC-10 new placement).
+    nid = get_host_tsm_node_id(node, ctx.nfs_name)
+    if nid is not None:
+        ctx.tsm_node_ids[node.hostname] = nid
+        log.info("[%s] cached TSM Node-id %s=%s from live lookup", label, node.hostname, nid)
+        return nid
+    log.error("[%s] no TSM Node-id for %s (not in deploy map)", label, node.hostname)
+    return None
+
+
+def _resolve_server_nid(ctx, label):
+    """Return pinned mount-server TSM Node-id (deploy map); never follow active[0]."""
+    if ctx.server_nid is not None:
+        return ctx.server_nid
+    # Resolve via pinned mount hostname, not whatever _refresh_active last saw.
+    mount_hn = ctx.mount_hostname or (ctx.server.hostname if ctx.server else None)
+    if mount_hn and mount_hn in ctx.tsm_node_ids:
+        ctx.server_nid = ctx.tsm_node_ids[mount_hn]
+        return ctx.server_nid
+    if ctx.server is not None:
+        nid = _nid_for(ctx, ctx.server, label)
+        if nid is not None:
+            ctx.server_nid = nid
+            return nid
+    log.error(
+        "[%s] no TSM Node-id for mount server %s",
+        label, mount_hn or "<unknown>",
+    )
+    return None
+
+
+def _wait_server_nid_counts(
+    ctx,
+    hosts,
+    since,
+    label,
+    expect_open=None,
+    expect_lock=None,
+    expect_deleg=None,
+    timeout=RECOVERY_TIMEOUT,
+):
+    """Wait for counts on mount-server Node-id in ``hosts`` TSM summaries.
+
+    Defaults to ``ctx.want_tsm`` when expect_* are omitted.
+    """
+    w = ctx.want_tsm or {}
+    open_c = w["open"] if expect_open is None else expect_open
+    lock_c = w["lock"] if expect_lock is None else expect_lock
+    deleg_c = w.get("deleg", 0) if expect_deleg is None else expect_deleg
+    nid = _resolve_server_nid(ctx, label)
+    if nid is None:
+        return None
+    return wait_peer_counts(
+        hosts,
+        ctx.nfs_name,
+        since,
+        open_c,
+        lock_c,
+        label,
+        expect_deleg=deleg_c,
+        timeout=timeout,
+        node_id=nid,
+    )
+
+
 def setup_suite_holds(ctx):
     """Start all holds once after deploy."""
     _refresh_active(ctx)
     ctx.hold_since, _ = get_node_time(ctx.peers)
+    if _resolve_server_nid(ctx, "setup") is None:
+        raise RuntimeError("setup: no TSM Node-id on mount server")
     cur_o = cur_l = cur_d = 0
     for i, step in enumerate(HOLD_STEPS):
         hold = _start_one_hold(ctx, i)
@@ -236,9 +340,15 @@ def setup_suite_holds(ctx):
         cur_o += step["delta_open"]
         cur_l += step["delta_lock"]
         cur_d += step["delta_deleg"]
-        if wait_peer_counts(
-            ctx.peers, ctx.nfs_name, ctx.hold_since,
-            cur_o, cur_l, f"setup:hold{i}", expect_deleg=cur_d,
+        # Peers print mount-server Node-id as holds sync — not the peer's own id.
+        if _wait_server_nid_counts(
+            ctx,
+            ctx.peers,
+            ctx.hold_since,
+            f"setup:hold{i}",
+            expect_open=cur_o,
+            expect_lock=cur_l,
+            expect_deleg=cur_d,
         ) is None:
             raise RuntimeError(f"setup hold {i} peer TSM timeout")
     ctx.want_tsm = {"open": cur_o, "lock": cur_l, "deleg": cur_d}
@@ -248,35 +358,81 @@ def pre_workflow(ctx, tag):
     _refresh_active(ctx)
     ctx.mds_pre = snapshot_mds_sessions(ctx.cmd, f"{tag}:pre")
     ctx.ganesha_id = record_ganesha_id(ctx.cmd, ctx.nfs_name)
-    w = ctx.want_tsm
-    if wait_peer_counts(
-        ctx.peers, ctx.nfs_name, ctx.hold_since,
-        w["open"], w["lock"], f"{tag}:pre",
-        expect_deleg=w.get("deleg", 0), timeout=RECOVERY_TIMEOUT,
+    # Baseline open/lock/deleg is on mount-server Node-id. After peer disrupt,
+    # peers only print their own Node-ids at 0 — do not use unfiltered peer last-line.
+    if _wait_server_nid_counts(
+        ctx, [ctx.server], ctx.hold_since, f"{tag}:pre",
     ) is None:
-        raise RuntimeError(f"[{tag}] pre-workflow peer TSM not at baseline")
+        raise RuntimeError(f"[{tag}] pre-workflow mount-server TSM not at baseline")
+
+
+def _post_peer_disrupt(ctx, tag):
+    """Peer-disrupt post: peer Node-ids empty after disrupt; mount server keeps baseline."""
+    _refresh_active(ctx)
+
+    for peer in ctx.peers:
+        # Use deploy-time map — live Ganesha ID scrape often misses after peer restart/rm.
+        nid = _nid_for(ctx, peer, tag)
+        if nid is None:
+            return 1
+        if wait_peer_counts(
+            [peer],
+            ctx.nfs_name,
+            ctx.disrupt_since,
+            0,
+            0,
+            f"{tag}:peer-zero Node-id={nid}",
+            expect_deleg=0,
+            timeout=RECOVERY_TIMEOUT,
+            node_id=nid,
+        ) is None:
+            return 1
+
+    if _wait_server_nid_counts(
+        ctx, [ctx.server], ctx.hold_since, f"{tag}:primary-retain",
+    ) is None:
+        return 1
+    return 0
 
 
 def post_workflow(ctx, tag):
     _refresh_active(ctx)
-    w = ctx.want_tsm
     log_since = ctx.disrupt_since or ctx.hold_since
-    if wait_peer_counts(
-        ctx.peers, ctx.nfs_name, log_since,
-        w["open"], w["lock"], f"{tag}:post",
-        expect_deleg=w.get("deleg", 0), timeout=RECOVERY_TIMEOUT,
-    ) is None:
-        return 1
-    if assert_ganesha_id_unchanged(ctx.ganesha_id, record_ganesha_id(ctx.cmd, ctx.nfs_name), tag):
-        return 1
-    if assert_mds_sessions_ok(ctx.mds_pre, snapshot_mds_sessions(ctx.cmd, f"{tag}:post"), tag):
-        return 1
-    if ctx.validator.assert_tsm_ready(
-        ctx.nfs_name, ctx.active, tsm_port=TSM_PORT, timeout=120,
-        log_since=ctx.disrupt_since, check_boot_logs=False,
-    ):
-        return 1
-    return 0
+    try:
+        if ctx.peer_disrupt_post:
+            if _post_peer_disrupt(ctx, tag):
+                return 1
+        else:
+            # Prefer peers' view of mount-server Node-id (primary disrupt / reboot).
+            # After peer-disrupt TCs peers stop publishing that Node-id — use server.
+            nid = _resolve_server_nid(ctx, f"{tag}:post")
+            if nid is None:
+                return 1
+            probe = peer_summary(
+                ctx.peers, ctx.nfs_name, since=log_since, node_id=nid,
+            )
+            hosts = ctx.peers if probe.get("seen") else [ctx.server]
+            if not probe.get("seen"):
+                log.info(
+                    "[%s] peers have no Node-id=%s summary; checking mount server",
+                    tag, nid,
+                )
+            if _wait_server_nid_counts(
+                ctx, hosts, log_since, f"{tag}:post",
+            ) is None:
+                return 1
+        if assert_ganesha_id_unchanged(ctx.ganesha_id, record_ganesha_id(ctx.cmd, ctx.nfs_name), tag):
+            return 1
+        if assert_mds_sessions_ok(ctx.mds_pre, snapshot_mds_sessions(ctx.cmd, f"{tag}:post"), tag):
+            return 1
+        if ctx.validator.assert_tsm_ready(
+            ctx.nfs_name, ctx.active, tsm_port=TSM_PORT, timeout=120,
+            log_since=ctx.disrupt_since, check_boot_logs=False,
+        ):
+            return 1
+        return 0
+    finally:
+        ctx.peer_disrupt_post = False
 
 
 def _for_hosts(ctx, hostnames, fn):
@@ -296,15 +452,10 @@ def tc_01_daemon_rm_primary(ctx, tag):
     old_cid = get_nfs_container_id(ctx.server, nfs_name=ctx.nfs_name)
     ctx.disrupt_since, _ = get_node_time(ctx.active)
     remove_nfs_daemon(ctx.cmd, ctx.nfs_name, host)
-    post = peer_summary(ctx.peers, ctx.nfs_name, since=ctx.disrupt_since)
-    w = ctx.want_tsm
-    if (
-        not post.get("seen")
-        or post["open"] < w["open"]
-        or post["lock"] < w["lock"]
-        or post.get("deleg", 0) < w.get("deleg", 0)
-    ):
-        log.error("[%s] mid-rm TSM want %s got %s", tag, w, post)
+    # Mid-rm: peers must still show mount-server Node-id baseline (not peer ids).
+    if _wait_server_nid_counts(
+        ctx, ctx.peers, ctx.disrupt_since, f"{tag}:mid-rm",
+    ) is None:
         return 1
     if not wait_daemon_running(ctx.cmd, ctx.nfs_name, host):
         return 1
@@ -322,6 +473,7 @@ def tc_03_daemon_redeploy_primary(ctx, tag):
 
 
 def tc_04_daemon_rm_peers(ctx, tag):
+    ctx.peer_disrupt_post = True
     peers = _peer_hosts(ctx)
     ctx.disrupt_since, _ = get_node_time(ctx.active)
     for host in peers:
@@ -330,11 +482,13 @@ def tc_04_daemon_rm_peers(ctx, tag):
 
 
 def tc_05_daemon_restart_peers(ctx, tag):
+    ctx.peer_disrupt_post = True
     ctx.disrupt_since, _ = get_node_time(ctx.active)
     return _for_hosts(ctx, _peer_hosts(ctx), restart_nfs_daemon)
 
 
 def tc_06_daemon_redeploy_peers(ctx, tag):
+    ctx.peer_disrupt_post = True
     ctx.disrupt_since, _ = get_node_time(ctx.active)
     return _for_hosts(ctx, _peer_hosts(ctx), redeploy_nfs_daemon)
 
@@ -369,12 +523,21 @@ def tc_07_mds_failover(ctx, tag):
 
 
 def _reboot_mount_server(ctx, tag):
+    host = ctx.mount_hostname or ctx.server.hostname
     ctx.disrupt_since, _ = get_node_time(ctx.active)
-    log.info("[%s] reboot mount server %s", tag, ctx.server.hostname)
-    return 0 if reboot_node(ctx.server) else 1
+    log.info("[%s] reboot mount server %s (Node-id=%s)", tag, host, ctx.server_nid)
+    if not reboot_node(ctx.server):
+        return 1
+    # Wait for NFS to return on the pinned mount host before post checks.
+    if not wait_daemon_running(ctx.cmd, ctx.nfs_name, host):
+        log.error("[%s] NFS daemon not running on mount server %s after reboot", tag, host)
+        return 1
+    _refresh_active(ctx)
+    return 0
 
 
 def tc_09_reboot_peers(ctx, tag):
+    ctx.peer_disrupt_post = True
     ctx.disrupt_since, _ = get_node_time(ctx.active)
     for node in ctx.peers:
         if not reboot_node(node):
@@ -420,6 +583,8 @@ def _run_one_tc(ctx, tc_id, tc10_pool, coredump_since):
     except Exception as exc:
         log.error("[%s] FAILED: %s", tc_id, exc)
         return "failed"
+    finally:
+        ctx.peer_disrupt_post = False
 
 
 def run(ceph_cluster, **kw):

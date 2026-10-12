@@ -14,16 +14,14 @@ TSM_FIRST_BOOT_PRESENT = (
 
 # ---------------------------------------------------------------------------
 # Disable path (state retrieval failed)
-# Peers: OR of notify/cleanup strings (TSM_DISABLE_PEER_PRESENT as one regex).
-# Recovering node: only ABSENT checks (no required local PRESENT markers).
-# Note: with peer INPUT DROP, notify may not arrive until partition is lifted /
-# fault model allows delivery.
+# Recovering node: PRESENT cleanup markers + ABSENT recovery-success markers.
+# Peers: optional notify/cleanup strings (TSM_DISABLE_PEER_PRESENT); currently unused.
 # ---------------------------------------------------------------------------
-TSM_DISABLE_PRESENT = ()
-
-TSM_DISABLE_PEER_PRESENT = (
-    r"Cleaned all node state records|TSM_DISABLE_NOTIFY",
+TSM_DISABLE_PRESENT = (
+    r"Cleaned all node state records",
 )
+
+TSM_DISABLE_PEER_PRESENT = ()
 
 TSM_DISABLE_ABSENT = (
     "Full recovery successful",

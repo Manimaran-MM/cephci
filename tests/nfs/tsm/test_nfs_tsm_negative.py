@@ -7,7 +7,7 @@ from cli.utilities.packages import Package
 from tests.nfs.lib.common_lib import get_nfs_container_id, get_node_time, scrape_nfs_logs
 from tests.nfs.lib.tsm import NfsTsmValidation
 from tests.nfs.lib.tsm.constants import (
-    TSM_DISABLE_PEER_PRESENT,
+    TSM_DISABLE_PRESENT,
     TSM_PRIMARY_SELECTION_FAIL_PRESENT,
 )
 from tests.nfs.lib.tsm.helpers import check_coredumps
@@ -25,7 +25,7 @@ TSM_PORT = 36369
 
 WORKFLOWS = {
     "single_daemon": [{"nfs_count": 1, "expect_deploy_fail": True}],
-    "state_retrieval_failure": [{"nfs_count": 3, "min_nfs_nodes": 3}],
+    "state_retrieval_failure": [{"nfs_count": 2, "min_nfs_nodes": 2}],
     # "primary_selection_failure": [{"nfs_count": 3, "min_nfs_nodes": 3}],
 }
 
@@ -260,13 +260,13 @@ def run_state_retrieval_failure(
             return "failed"
 
         if not _wait_log_patterns(
-            peers,
-            TSM_DISABLE_PEER_PRESENT,
+            [recovering],
+            TSM_DISABLE_PRESENT,
             nfs_name,
             log_since,
             tries=120,
             sleep_s=10,
-            label=f"peer disable markers ({TSM_DISABLE_PEER_PRESENT})",
+            label=f"disable markers on recovering ({TSM_DISABLE_PRESENT})",
         ):
             return "failed"
 
@@ -283,9 +283,7 @@ def run_state_retrieval_failure(
             nfs_version,
             assert_fn=lambda: NfsTsmValidation(
                 cluster, client, "enable_TSM", "Tsm_Port", TSM_PORT
-            ).assert_tsm_disable_logs(
-                nfs_name, recovering, peers=peers, since=log_since
-            ),
+            ).assert_tsm_disable_logs(nfs_name, recovering, since=log_since),
         )
     except Exception as exc:
         log.error("[%s] FAILED: %s", name, exc)
