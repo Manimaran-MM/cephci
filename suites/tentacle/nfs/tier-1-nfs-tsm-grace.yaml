@@ -163,6 +163,14 @@ tests:
         nfs_version: "4.2"
         nfs_count: 4
   #       workflows: ["TC-TSM-G-R01"]
+      comments: |
+        TC-TSM-G-C16 - IBMCEPH-19165, IBMCEPH-18586
+        TC-TSM-G-C17 - IBMCEPH-19165, IBMCEPH-18586
+        TC-TSM-G-C18 - IBMCEPH-19165, IBMCEPH-18586
+        TC-TSM-G-C19 - IBMCEPH-19165, IBMCEPH-18586
+        TC-TSM-G-C20 - IBMCEPH-19165, IBMCEPH-18586
+        TC-TSM-G-C21 - IBMCEPH-19165, IBMCEPH-18586
+        TC-TSM-G-C22 - IBMCEPH-19165, IBMCEPH-18586
 
   - test:
       name: NFS TSM - Grace share-deny (Rn4-DB5)

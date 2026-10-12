@@ -14,6 +14,7 @@ import time
 import uuid
 
 import yaml
+
 from cli.ceph.ceph import Ceph
 from cli.cephadm.cephadm import CephAdm
 from cli.utilities.filesys import Mount
@@ -35,9 +36,7 @@ TIMEOUT = 300
 WORKFLOWS = {
     "basic": [{}],
     "placement_hosts": [{"placement": "hosts"}],
-    "placement_count": [
-        {"placement": "count", "nfs_count": 2, "min_nfs_nodes": 3}
-    ],
+    "placement_count": [{"placement": "count", "nfs_count": 2, "min_nfs_nodes": 3}],
     "custom_ports": [{"nfs_port": 12049, "tsm_port": 36370}],
     "tsm_disabled": [
         {"enable_tsm": False, "expect_enabled": None, "check_peers": False}
@@ -214,7 +213,9 @@ def deploy_step(cluster, installer, client, nodes, step, nfs_name, tag):
         for spec in specs:
             enable_nfs_debug_logs(client, spec["service_id"], "TSM")
     else:
-        log.info("[%s] skipping deploy-time TSM debug (caller enables combined logging)", tag)
+        log.info(
+            "[%s] skipping deploy-time TSM debug (caller enables combined logging)", tag
+        )
 
     active = []
     for _ in range(30):

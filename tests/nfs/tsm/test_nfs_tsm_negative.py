@@ -3,7 +3,11 @@
 import time
 
 from cli.utilities.packages import Package
-from tests.nfs.lib.common_lib import get_nfs_container_id, get_node_time, scrape_nfs_logs
+from tests.nfs.lib.common_lib import (
+    get_nfs_container_id,
+    get_node_time,
+    scrape_nfs_logs,
+)
 from tests.nfs.lib.tsm import NfsTsmValidation
 from tests.nfs.lib.tsm.constants import (
     TSM_DISABLE_PRESENT,
@@ -36,9 +40,7 @@ WORKFLOWS = {
 
 def _ensure_pkg_binary(node, package, binary):
     """Install package if binary is missing. Returns False on failure."""
-    out, _ = node.exec_command(
-        sudo=True, cmd=f"command -v {binary}", check_ec=False
-    )
+    out, _ = node.exec_command(sudo=True, cmd=f"command -v {binary}", check_ec=False)
     if out and str(out).strip():
         return True
     log.info("Installing %s on %s (missing %s)", package, node.hostname, binary)
@@ -47,9 +49,7 @@ def _ensure_pkg_binary(node, package, binary):
     except Exception as exc:
         log.error("Failed to install %s on %s: %s", package, node.hostname, exc)
         return False
-    out, _ = node.exec_command(
-        sudo=True, cmd=f"command -v {binary}", check_ec=False
-    )
+    out, _ = node.exec_command(sudo=True, cmd=f"command -v {binary}", check_ec=False)
     if not (out and str(out).strip()):
         log.error("%s still missing on %s after install", binary, node.hostname)
         return False

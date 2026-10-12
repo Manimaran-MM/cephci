@@ -53,14 +53,16 @@ from tests.nfs.lib.tsm.helpers import (
     check_coredumps,
     cleanup_grace_suite,
     close_interactive,
-    require_tsm_node_ids,
     ensure_deleg_export,
     file_base,
     fmt_tsm,
     log_workflow_summary,
-    mount_clients as _mount_clients,
+)
+from tests.nfs.lib.tsm.helpers import mount_clients as _mount_clients
+from tests.nfs.lib.tsm.helpers import (
     mount_spare_export,
     peer_summary,
+    require_tsm_node_ids,
     seed_wf_files,
     start_spare_hold,
     wait_peer_counts,
@@ -90,12 +92,8 @@ DELEG_FILE_IDX = 3  # R06: write-deleg plant/conflict on wf3.txt
 WO, RO, RW = "WRITE_ONLY", "READ_ONLY", "READ_WRITE"
 SHARE_ACCESS = {RO: 1, WO: 2, RW: 3}
 
-CONFLICT_SA_RE = re.compile(
-    r"Open conflict existing_sa=(\d+) new_sa=(\d+)", re.I
-)
-CONFLICT_GRACE_RE = re.compile(
-    r"Conflicting open\.\s*Return NFS4ERR_GRACE", re.I
-)
+CONFLICT_SA_RE = re.compile(r"Open conflict existing_sa=(\d+) new_sa=(\d+)", re.I)
+CONFLICT_GRACE_RE = re.compile(r"Conflicting open\.\s*Return NFS4ERR_GRACE", re.I)
 
 # c2_expect: "blocked" → hang + after-grace complete; "success" → ok during grace.
 WORKFLOWS = {
@@ -455,9 +453,9 @@ def _backdate_since(since, skew_sec):
     delta = timedelta(seconds=skew_sec)
 
     def _one(ts):
-        return (
-            datetime.strptime(ts, "%Y-%m-%dT%H:%M:%SZ") - delta
-        ).strftime("%Y-%m-%dT%H:%M:%SZ")
+        return (datetime.strptime(ts, "%Y-%m-%dT%H:%M:%SZ") - delta).strftime(
+            "%Y-%m-%dT%H:%M:%SZ"
+        )
 
     if isinstance(since, dict):
         return {h: _one(ts) for h, ts in since.items()}
@@ -854,7 +852,9 @@ def tc_conflict_generic(ctx, spec, nfs_version="4.2"):
                 c1_sess, pre_idx, pre_mode, pre_lock, label, unlock_list=c1_unlock_idxs
             ):
                 return 1
-            if _hold_expect(ctx, baseline, label, open_since, use_deleg, bool(pre_lock)):
+            if _hold_expect(
+                ctx, baseline, label, open_since, use_deleg, bool(pre_lock)
+            ):
                 return 1
             log.info("[%s] → pre-grace records ok (held through grace)", label)
 
@@ -882,9 +882,7 @@ def tc_conflict_generic(ctx, spec, nfs_version="4.2"):
                 return 1
             if pre_c2_lock:
                 c2_held_lock = True
-            if _hold_expect(
-                ctx, baseline, label, open_since, False, bool(pre_c2_lock)
-            ):
+            if _hold_expect(ctx, baseline, label, open_since, False, bool(pre_c2_lock)):
                 return 1
             log.info("[%s] → C2 pre-grace records ok (held through grace)", label)
 
@@ -953,15 +951,15 @@ def tc_conflict_generic(ctx, spec, nfs_version="4.2"):
                 ctx, conflict_existing_mode, c2_mode, open_since, label
             ):
                 return 1
-            if _tsm_expect(
-                ctx, baseline, label, open_since, False, open_delta=1
-            ):
+            if _tsm_expect(ctx, baseline, label, open_since, False, open_delta=1):
                 return 1
             # Pre-grace floor still present
             if pre_grace or pre_grace_c2:
                 if use_deleg:
                     if int(baseline.get("open", 0)) < 1:
-                        log.error("[%s] pre-grace open missing during blocked open", label)
+                        log.error(
+                            "[%s] pre-grace open missing during blocked open", label
+                        )
                         return 1
                     if int(baseline.get("deleg", 0)) < 1:
                         log.error(
@@ -972,8 +970,7 @@ def tc_conflict_generic(ctx, spec, nfs_version="4.2"):
                     min_open = 2 if pre_grace_c2 else 1
                     if int(baseline.get("open", 0)) < min_open:
                         log.error(
-                            "[%s] pre-grace open floor missing "
-                            "(want≥%s got=%s)",
+                            "[%s] pre-grace open floor missing " "(want≥%s got=%s)",
                             label,
                             min_open,
                             baseline.get("open"),
@@ -1011,7 +1008,10 @@ def tc_conflict_generic(ctx, spec, nfs_version="4.2"):
         else:
             if c2_lock_during:
                 announce(f"[{label}] {c2_lock_during} expect=success")
-                if c2_sess.lock_file(WF_FILE_IDX, c2_lock_during, timeout=15) != "success":
+                if (
+                    c2_sess.lock_file(WF_FILE_IDX, c2_lock_during, timeout=15)
+                    != "success"
+                ):
                     log.error("[%s] C2 %s failed", label, c2_lock_during)
                     return 1
                 c2_held_lock = True
@@ -1178,21 +1178,15 @@ def tc_recover_primary(ctx, spec, nfs_version="4.2"):
             if not sess:
                 return 1
 
-            label = f"{tag} {pname} plant {who} {mode}" + (
-                f"+{lock}" if lock else ""
-            )
+            label = f"{tag} {pname} plant {who} {mode}" + (f"+{lock}" if lock else "")
             announce(
                 f"[{label}] open expect=success; TSM open={want_open} "
                 f"lock={want_lock} (primary)"
             )
             plant_since, _ = get_node_time(watch)
-            if _open_then_lock(
-                sess, idx, mode, lock, label, close_list, unlock_list
-            ):
+            if _open_then_lock(sess, idx, mode, lock, label, close_list, unlock_list):
                 return 1
-            if _wait_tsm(
-                watch, ctx, plant_since, want_open, want_lock, label, node_id
-            ):
+            if _wait_tsm(watch, ctx, plant_since, want_open, want_lock, label, node_id):
                 return 1
             log.info(
                 "[%s] → planted cumulative open=%s lock=%s (fds held idle)",
@@ -1413,13 +1407,9 @@ def tc_recover_primary(ctx, spec, nfs_version="4.2"):
                     )
                     if snap.get("seen") and int(snap.get("open", 0)) == want_after:
                         if c_sess.wait_opened(idx, timeout=90) != "success":
-                            log.error(
-                                "[%s] hanging open did not complete", label
-                            )
+                            log.error("[%s] hanging open did not complete", label)
                             return 1
-                        if _deleg_early(
-                            f"TSM open already {want_after} while blocked"
-                        ):
+                        if _deleg_early(f"TSM open already {want_after} while blocked"):
                             return 1
                         continue
                     _track_idx(c_close, idx)
@@ -1538,9 +1528,7 @@ def tc_recover_primary(ctx, spec, nfs_version="4.2"):
                 if got != "blocked":
                     log.error("[%s] open want=blocked got=%s", label, got)
                     return 1
-                if _validate_conflict_logs(
-                    ctx, existing_mode, mode, open_since, label
-                ):
+                if _validate_conflict_logs(ctx, existing_mode, mode, open_since, label):
                     return 1
                 time.sleep(2)
                 snap = peer_summary(
@@ -1548,9 +1536,7 @@ def tc_recover_primary(ctx, spec, nfs_version="4.2"):
                 )
                 if snap.get("seen") and int(snap.get("open", 0)) == want_after:
                     if sess.wait_opened(idx, timeout=90) != "success":
-                        log.error(
-                            "[%s] hanging open did not complete", label
-                        )
+                        log.error("[%s] hanging open did not complete", label)
                         return 1
                     if _early(f"TSM open already {want_after} while blocked"):
                         return 1
@@ -1573,10 +1559,7 @@ def tc_recover_primary(ctx, spec, nfs_version="4.2"):
 
             if hanging:
                 hs = hanging
-                label = (
-                    f"{tag} conflict after grace "
-                    f"(same open idx={hs['idx']})"
-                )
+                label = f"{tag} conflict after grace " f"(same open idx={hs['idx']})"
                 announce(
                     f"[{label}] wait hanging open; "
                     f"{fmt_tsm(hs['want_open'], hs['want_lock'], hs.get('want_deleg'))}"
@@ -1651,9 +1634,9 @@ def tc_recover_primary(ctx, spec, nfs_version="4.2"):
 def _log_tc_overview(ctx):
     primary = ctx.server.hostname if ctx.server else "N/A"
     spare = ctx.spare_node.hostname if ctx.spare_node else "N/A"
-    ids = ", ".join(
-        f"{h}={nid}" for h, nid in sorted(ctx.tsm_node_ids.items())
-    ) or "N/A"
+    ids = (
+        ", ".join(f"{h}={nid}" for h, nid in sorted(ctx.tsm_node_ids.items())) or "N/A"
+    )
     deleg = getattr(ctx, "deleg_export", None) or "N/A"
     log.info(
         "\n========== OVERVIEW =========================\n"

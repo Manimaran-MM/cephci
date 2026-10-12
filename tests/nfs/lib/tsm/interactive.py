@@ -27,7 +27,11 @@ def _local_src():
         return SRC_C
     return os.path.abspath(
         os.path.join(
-            os.path.dirname(__file__), "..", "..", "scripts_tools", "common_interactive.c"
+            os.path.dirname(__file__),
+            "..",
+            "..",
+            "scripts_tools",
+            "common_interactive.c",
         )
     )
 
@@ -37,9 +41,7 @@ def ensure_interactive_binary(client):
     try:
         client.upload_file(sudo=True, src=_local_src(), dst=REMOTE_C)
     except Exception as exc:
-        log.error(
-            "upload common_interactive.c to %s failed: %s", client.hostname, exc
-        )
+        log.error("upload common_interactive.c to %s failed: %s", client.hostname, exc)
         return 1
 
     client.exec_command(

@@ -17,9 +17,7 @@ TSM_FIRST_BOOT_PRESENT = (
 # Recovering node: PRESENT cleanup markers + ABSENT recovery-success markers.
 # Peers: optional notify/cleanup strings (TSM_DISABLE_PEER_PRESENT); currently unused.
 # ---------------------------------------------------------------------------
-TSM_DISABLE_PRESENT = (
-    r"Cleaned all node state records",
-)
+TSM_DISABLE_PRESENT = (r"Cleaned all node state records",)
 
 TSM_DISABLE_PEER_PRESENT = ()
 
@@ -98,7 +96,9 @@ class NfsFcntlLock:
         return "os.O_RDWR|os.O_CREAT", True
 
     @staticmethod
-    def _hold_cmd(path, lock_type, start=0, length=0, flags="os.O_RDWR|os.O_CREAT", seed=False):
+    def _hold_cmd(
+        path, lock_type, start=0, length=0, flags="os.O_RDWR|os.O_CREAT", seed=False
+    ):
         """Hold lock until SIGTERM/SIGINT → explicit F_UNLCK then close."""
         open_stmt = (
             f"fd=os.open(path,{flags},0o644);"
@@ -106,10 +106,12 @@ class NfsFcntlLock:
             else f"fd=os.open(path,{flags});"
         )
         seed_stmt = (
-            "os.write(fd,b'x'*4096) if os.fstat(fd).st_size==0 else None;" if seed else ""
+            "os.write(fd,b'x'*4096) if os.fstat(fd).st_size==0 else None;"
+            if seed
+            else ""
         )
         return (
-            "python3 -c \""
+            'python3 -c "'
             "import fcntl,os,struct,signal,sys;"
             f"path='{path}';start={int(start)};length={int(length)};"
             "pack=lambda t:struct.pack('hhqqq',t,os.SEEK_SET,start,length,0);"
@@ -119,7 +121,7 @@ class NfsFcntlLock:
             "u=lambda *a:(fcntl.fcntl(fd,fcntl.F_SETLK,pack(fcntl.F_UNLCK)),"
             "print('UNLOCKED',flush=True),os.close(fd),sys.exit(0));"
             "signal.signal(signal.SIGTERM,u);signal.signal(signal.SIGINT,u);"
-            "signal.pause()\""
+            'signal.pause()"'
         )
 
     @staticmethod
@@ -152,7 +154,7 @@ class NfsFcntlLock:
     def exclusive_then_unlock_hold(path, hold_secs=8):
         """F_WRLCK, hold briefly, F_UNLCK, keep FD open (unlock-without-close)."""
         return (
-            "python3 -c \""
+            'python3 -c "'
             "import fcntl,os,struct,signal,time,sys;"
             f"path='{path}';start=0;length=0;"
             "pack=lambda t:struct.pack('hhqqq',t,os.SEEK_SET,start,length,0);"
@@ -165,21 +167,21 @@ class NfsFcntlLock:
             "print('UNLOCKED',flush=True);"
             "u=lambda *a:(os.close(fd),sys.exit(0));"
             "signal.signal(signal.SIGTERM,u);signal.signal(signal.SIGINT,u);"
-            "signal.pause()\""
+            'signal.pause()"'
         )
 
     @staticmethod
     def read_at_offset_hold(path, offset, length=100):
         """Read unlocked range and keep FD open (no lock)."""
         return (
-            "python3 -c \""
+            'python3 -c "'
             "import os,signal,sys;"
             f"fd=os.open('{path}',os.O_RDONLY);"
             f"os.lseek(fd,{int(offset)},0);"
             f"os.read(fd,{int(length)});"
             "u=lambda *a:(os.close(fd),sys.exit(0));"
             "signal.signal(signal.SIGTERM,u);signal.signal(signal.SIGINT,u);"
-            "signal.pause()\""
+            'signal.pause()"'
         )
 
     @staticmethod
@@ -191,4 +193,3 @@ class NfsFcntlLock:
             cmd=f"kill {pid} 2>/dev/null",
             check_ec=False,
         )
-

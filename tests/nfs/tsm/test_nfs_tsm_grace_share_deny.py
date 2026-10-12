@@ -47,14 +47,16 @@ from tests.nfs.lib.tsm.helpers import (
     check_coredumps,
     cleanup_grace_suite,
     close_interactive,
-    require_tsm_node_ids,
     ensure_deleg_export,
     file_base,
     fmt_tsm,
     log_workflow_summary,
-    mount_clients as _mount_clients,
+)
+from tests.nfs.lib.tsm.helpers import mount_clients as _mount_clients
+from tests.nfs.lib.tsm.helpers import (
     mount_spare_export,
     peer_summary,
+    require_tsm_node_ids,
     seed_wf_files,
     start_spare_hold,
     wait_peer_counts,
@@ -83,12 +85,8 @@ WO, RO, RW = "WRITE_ONLY", "READ_ONLY", "READ_WRITE"
 MODE_SA = {RO: 1, WO: 2, RW: 3}
 ACCESS_SA = {"r": 1, "w": 2, "rw": 3}
 
-CONFLICT_SA_RE = re.compile(
-    r"Open conflict existing_sa=(\d+) new_sa=(\d+)", re.I
-)
-CONFLICT_GRACE_RE = re.compile(
-    r"Conflicting open\.\s*Return NFS4ERR_GRACE", re.I
-)
+CONFLICT_SA_RE = re.compile(r"Open conflict existing_sa=(\d+) new_sa=(\d+)", re.I)
+CONFLICT_GRACE_RE = re.compile(r"Conflicting open\.\s*Return NFS4ERR_GRACE", re.I)
 
 WORKFLOWS = {
     "TC-TSM-G-SD-Rn0": {
@@ -304,9 +302,7 @@ WORKFLOWS = {
         ],
     },
     "TC-TSM-G-SD-Wn5": {
-        "desc": (
-            "w deny n WRITE deleg; C2 RO blocked; after RO success + recall"
-        ),
+        "desc": ("w deny n WRITE deleg; C2 RO blocked; after RO success + recall"),
         "use_deleg_export": True,
         "want_deleg": True,
         "c1_access": "w",
@@ -334,9 +330,7 @@ WORKFLOWS = {
         ],
     },
     "TC-TSM-G-SD-Dn5": {
-        "desc": (
-            "rw deny n WRITE deleg; C2 RO blocked; after RO success + recall"
-        ),
+        "desc": ("rw deny n WRITE deleg; C2 RO blocked; after RO success + recall"),
         "use_deleg_export": True,
         "want_deleg": True,
         "c1_access": "rw",
@@ -418,9 +412,7 @@ def _workflow_peers(ctx):
 
 
 def _seed_wf_file(client, mount, indices=None):
-    seed_wf_files(
-        client, mount, indices if indices is not None else [WF_FILE_IDX]
-    )
+    seed_wf_files(client, mount, indices if indices is not None else [WF_FILE_IDX])
 
 
 def _close_and_stop(sess, indexes=None, unlock_indexes=None):
@@ -751,20 +743,14 @@ def tc_share_deny(ctx, spec, nfs_version="4.2"):
             got = sess.open_file(WF_FILE_IDX, mode, timeout=timeout)
             if got != expect:
                 log.error("[%s] want=%s got=%s", label, expect, got)
-                _close_and_stop(
-                    sess, indexes=[WF_FILE_IDX] if got == "success" else []
-                )
+                _close_and_stop(sess, indexes=[WF_FILE_IDX] if got == "success" else [])
                 return 1
 
             if expect == "blocked":
-                if _validate_conflict_logs(
-                    ctx, c1_access, mode, open_since, label
-                ):
+                if _validate_conflict_logs(ctx, c1_access, mode, open_since, label):
                     _close_and_stop(sess)
                     return 1
-                if _tsm_expect(
-                    ctx, baseline, label, open_since, False, open_delta=1
-                ):
+                if _tsm_expect(ctx, baseline, label, open_since, False, open_delta=1):
                     _close_and_stop(sess)
                     return 1
                 if blocked_baseline is None:
@@ -788,9 +774,7 @@ def tc_share_deny(ctx, spec, nfs_version="4.2"):
                 )
                 log.info("[%s] → blocked (session kept for after-grace)", label)
             elif expect == "denied":
-                if _tsm_expect(
-                    ctx, baseline, label, open_since, False, open_delta=1
-                ):
+                if _tsm_expect(ctx, baseline, label, open_since, False, open_delta=1):
                     _close_and_stop(sess)
                     return 1
                 _close_and_stop(sess)
@@ -1111,9 +1095,7 @@ def run(ceph_cluster, **kw):
                 results[tc_id] = "failed"
                 continue
             try:
-                rc = tc_share_deny(
-                    ctx, dict(spec, id=tc_id), nfs_version=nfs_version
-                )
+                rc = tc_share_deny(ctx, dict(spec, id=tc_id), nfs_version=nfs_version)
                 results[tc_id] = "passed" if rc == 0 else "failed"
             except Exception as exc:
                 log.error("[%s] FAILED: %s", tc_id, exc)

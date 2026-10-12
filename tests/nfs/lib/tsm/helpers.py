@@ -199,7 +199,10 @@ def wait_peer_counts(
 
     log.error(
         "[%s] peer summary timeout: want %s node_id=%s last=%s",
-        label, want, node_id, last,
+        label,
+        want,
+        node_id,
+        last,
     )
     if raise_on_timeout:
         raise OperationFailedError("[%s] TSM timeout want %s" % (label, want))
@@ -207,15 +210,29 @@ def wait_peer_counts(
 
 
 def wait_counts_ok(
-    peers, nfs_name, since, expect_open, expect_lock, label,
-    expect_deleg=None, timeout=POLL_TIMEOUT, node_id=None,
+    peers,
+    nfs_name,
+    since,
+    expect_open,
+    expect_lock,
+    label,
+    expect_deleg=None,
+    timeout=POLL_TIMEOUT,
+    node_id=None,
 ):
     """Like ``wait_peer_counts`` but return 0 ok / 1 timeout."""
     return (
         0
         if wait_peer_counts(
-            peers, nfs_name, since, expect_open, expect_lock, label,
-            expect_deleg=expect_deleg, timeout=timeout, node_id=node_id,
+            peers,
+            nfs_name,
+            since,
+            expect_open,
+            expect_lock,
+            label,
+            expect_deleg=expect_deleg,
+            timeout=timeout,
+            node_id=node_id,
         )
         is not None
         else 1
@@ -241,8 +258,15 @@ def wait_server_nid_counts(
     if nid is None:
         return None
     return wait_peer_counts(
-        hosts, ctx.nfs_name, since, open_c, lock_c, label,
-        expect_deleg=deleg_c, timeout=timeout, node_id=nid,
+        hosts,
+        ctx.nfs_name,
+        since,
+        open_c,
+        lock_c,
+        label,
+        expect_deleg=deleg_c,
+        timeout=timeout,
+        node_id=nid,
     )
 
 
@@ -318,7 +342,9 @@ def check_coredumps(nodes, since, tag):
     return 0
 
 
-def mount_clients(clients, nfs_name, export, mount, nfs_port, server, nfs_version="4.2"):
+def mount_clients(
+    clients, nfs_name, export, mount, nfs_port, server, nfs_version="4.2"
+):
     """Create export and mount on each client. Return 0 ok, 1 on mount failure."""
     Ceph(clients[0]).nfs.export.create(
         fs_name="cephfs", nfs_name=nfs_name, nfs_export=export, fs="cephfs"
@@ -572,8 +598,7 @@ def log_workflow_summary(results, title="TSM WORKFLOW SUMMARY", name_width=28):
         title,
         "=" * 60,
         rows,
-        "-" * 60
-        + f"\n  Total: {len(results)}  Passed: {len(passed)}  "
+        "-" * 60 + f"\n  Total: {len(results)}  Passed: {len(passed)}  "
         f"Failed: {len(failed)}  Skipped: {len(skipped)}",
         "=" * 60,
     )

@@ -18,7 +18,6 @@ TSM counters and grant/recall/CLOSE evidence come from ``podman logs --since``.
 import re
 import time
 
-from cli.exceptions import OperationFailedError
 from nfs_delegation_operations import (
     ensure_ceph_conf_and_admin_keyring_on_hosts,
     log_delegation_open_types,
@@ -27,7 +26,13 @@ from nfs_delegation_operations import (
     validate_delegation_grant_capture,
     validate_delegation_recall_ganesha_capture,
 )
-from tests.nfs.lib.common_lib import enable_nfs_debug_logs, get_node_time, scrape_nfs_logs
+
+from cli.exceptions import OperationFailedError
+from tests.nfs.lib.common_lib import (
+    enable_nfs_debug_logs,
+    get_node_time,
+    scrape_nfs_logs,
+)
 from tests.nfs.lib.multi_active.delegation import NfsMultiActiveDelegation
 from tests.nfs.lib.tsm.constants import DELEG_LOG_RE, NfsFdHold
 from tests.nfs.lib.tsm.helpers import (
@@ -139,7 +144,9 @@ def _start_hold(client, cmd, holds, action, expecting):
     holds.append((client, pid))
 
 
-def _close_holds(holds, peers, nodes, nfs_name, base_open, base_lock, base_deleg, label):
+def _close_holds(
+    holds, peers, nodes, nfs_name, base_open, base_lock, base_deleg, label
+):
     """Kill holds; assert CLOSE in logs; wait TSM back to baseline."""
     announce("Do CLOSE / release hold(s)", fmt_tsm(base_open, base_lock, base_deleg))
     close_since, _ = get_node_time(nodes)
@@ -166,7 +173,9 @@ def _close_holds(holds, peers, nodes, nfs_name, base_open, base_lock, base_deleg
 class DelegCtx:
     """Handles and counters shared by every WORKFLOWS handler."""
 
-    def __init__(self, clients, peers, nodes, nfs_cmd_host, nfs_name, export, mount, paths):
+    def __init__(
+        self, clients, peers, nodes, nfs_cmd_host, nfs_name, export, mount, paths
+    ):
         self.client_a = clients[0]
         self.client_b = clients[1]
         self.peers = peers
@@ -242,9 +251,7 @@ def _assert_no_deleg_types(label, hits):
     if any(t in (4, 5) for t in types) or re.search(
         r"delegation_type\s+[45]\b", "\n".join(hits or []), re.I
     ):
-        raise OperationFailedError(
-            "[%s] expected no type 4/5, got %r" % (label, types)
-        )
+        raise OperationFailedError("[%s] expected no type 4/5, got %r" % (label, types))
     return types
 
 
@@ -477,7 +484,9 @@ def _wf_none(ctx):
         fmt_tsm(held["open"], held["lock"], held["deleg"]),
         fmt_tsm(snap["open"], snap["lock"], snap["deleg"]),
     )
-    NfsMultiActiveDelegation.enable_rw_export(ctx.nfs_cmd_host, ctx.nfs_name, ctx.export)
+    NfsMultiActiveDelegation.enable_rw_export(
+        ctx.nfs_cmd_host, ctx.nfs_name, ctx.export
+    )
 
 
 def _wf_rw_write_type5(ctx):

@@ -49,9 +49,7 @@ class NfsTsmValidation:
         """Return cluster info dict, or None on failure."""
         info = Ceph(self.client).nfs.cluster.info(nfs_name)
         if not info or nfs_name not in info:
-            log.error(
-                "Cluster %r not found in nfs cluster info: %r", nfs_name, info
-            )
+            log.error("Cluster %r not found in nfs cluster info: %r", nfs_name, info)
             return None
         log.info("NFS cluster info for %s:\n%s", nfs_name, json.dumps(info, indent=2))
         return info[nfs_name]
@@ -291,8 +289,11 @@ class NfsTsmValidation:
             for pat in TSM_DISABLE_PEER_PRESENT:
                 if (
                     scrape_nfs_logs(
-                        peer_list, pat, nfs_name=nfs_name,
-                        require_match=True, since=since,
+                        peer_list,
+                        pat,
+                        nfs_name=nfs_name,
+                        require_match=True,
+                        since=since,
                     )
                     is None
                 ):
@@ -303,7 +304,8 @@ class NfsTsmValidation:
         """Return 0 if all-peers-down disable markers match (no partial primary)."""
         log.info(
             "TSM PRIMARY-SELECTION-FAIL LOG VALIDATION (%s on %s)",
-            nfs_name, node.hostname,
+            nfs_name,
+            node.hostname,
         )
         return self._assert_boot_path(
             node,
@@ -354,9 +356,7 @@ class NfsTsmValidation:
         active = []
         for _ in WaitUntil(timeout=timeout, interval=self.poll_interval):
             active = [
-                n
-                for n in nfs_nodes
-                if get_nfs_container_id(n, nfs_name=nfs_name)
+                n for n in nfs_nodes if get_nfs_container_id(n, nfs_name=nfs_name)
             ]
             if not active:
                 log.warning("NFS containers not up yet for %s", nfs_name)
@@ -383,9 +383,7 @@ class NfsTsmValidation:
                     log.warning("TSM port not listening yet")
                     continue
                 if check_boot_logs:
-                    if self.assert_tsm_boot_logs(
-                        nfs_name, active, since=log_since
-                    ):
+                    if self.assert_tsm_boot_logs(nfs_name, active, since=log_since):
                         log.warning("TSM boot logs not ready yet")
                         continue
                 elif log_patterns:

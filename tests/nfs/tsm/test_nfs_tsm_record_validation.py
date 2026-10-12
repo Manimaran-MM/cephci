@@ -16,13 +16,13 @@ from tests.nfs.lib.tsm.helpers import (
     announce,
     check_coredumps,
     fmt_tsm,
-    kill_holds as _kill_holds,
-    log_workflow_summary,
-    mount_clients as _mount_clients,
-    peer_summary as _peer_summary,
-    start_bg as _bg,
-    wait_counts_ok as _wait_counts,
 )
+from tests.nfs.lib.tsm.helpers import kill_holds as _kill_holds
+from tests.nfs.lib.tsm.helpers import log_workflow_summary
+from tests.nfs.lib.tsm.helpers import mount_clients as _mount_clients
+from tests.nfs.lib.tsm.helpers import peer_summary as _peer_summary
+from tests.nfs.lib.tsm.helpers import start_bg as _bg
+from tests.nfs.lib.tsm.helpers import wait_counts_ok as _wait_counts
 from tests.nfs.tsm.test_nfs_tsm_basic import deploy_step, safe_cleanup
 from utility.log import Log
 
@@ -120,12 +120,12 @@ WORKFLOWS = {
         "delta_lock": 0,
         "cmds": [
             (
-                "python3 -c \""
+                'python3 -c "'
                 "import mmap,os,time;"
                 "p='{mount}/mmap_%d.txt'%time.time();"
                 "fd=os.open(p,os.O_RDWR|os.O_CREAT,0o644);"
                 "os.write(fd,b'x'*4096);os.lseek(fd,0,0);"
-                "m=mmap.mmap(fd,4096);time.sleep(10**9)\""
+                'm=mmap.mmap(fd,4096);time.sleep(10**9)"'
             ),
         ],
     },
@@ -152,7 +152,7 @@ WORKFLOWS = {
         "delta_lock": 1,
         "setup": [
             (
-                "python3 -c \""
+                'python3 -c "'
                 "import os;"
                 "p='{mount}/br_lock.txt';"
                 "fd=os.open(p,os.O_RDWR|os.O_CREAT,0o644);"
@@ -172,10 +172,10 @@ WORKFLOWS = {
         ],
         "cmds": [
             (
-                "python3 -c \""
+                'python3 -c "'
                 "import os,time;"
                 "fd=os.open('{mount}/trunc.txt',os.O_WRONLY|os.O_TRUNC);"
-                "time.sleep(10**9)\""
+                'time.sleep(10**9)"'
             ),
         ],
     },
@@ -197,7 +197,7 @@ WORKFLOWS = {
         "min_clients": 2,
         "setup": [
             (
-                "python3 -c \""
+                'python3 -c "'
                 "import os;"
                 "p='{mount}/br_pair.txt';"
                 "fd=os.open(p,os.O_RDWR|os.O_CREAT,0o666);"
@@ -281,7 +281,7 @@ WORKFLOWS = {
         "delta_lock": 1,
         "setup": [
             (
-                "python3 -c \""
+                'python3 -c "'
                 "import os;"
                 "p='{mount}/br_shared.txt';"
                 "fd=os.open(p,os.O_RDWR|os.O_CREAT,0o666);"
@@ -289,9 +289,7 @@ WORKFLOWS = {
             ),
         ],
         "cmds": [
-            NfsFcntlLock.byte_range_hold(
-                "{mount}/br_shared.txt", 100, 0, shared=True
-            ),
+            NfsFcntlLock.byte_range_hold("{mount}/br_shared.txt", 100, 0, shared=True),
         ],
     },
     # Two shared byte-range locks (same range, two clients) — open +2, lock +2
@@ -301,7 +299,7 @@ WORKFLOWS = {
         "min_clients": 2,
         "setup": [
             (
-                "python3 -c \""
+                'python3 -c "'
                 "import os;"
                 "p='{mount}/br_shared_pair.txt';"
                 "fd=os.open(p,os.O_RDWR|os.O_CREAT,0o666);"
@@ -330,7 +328,7 @@ WORKFLOWS = {
         "min_clients": 2,
         "setup": [
             (
-                "python3 -c \""
+                'python3 -c "'
                 "import os;"
                 "p='{mount}/br_access.txt';"
                 "fd=os.open(p,os.O_RDWR|os.O_CREAT,0o666);"
@@ -445,7 +443,7 @@ def _run_byte_range_overlap_block(clients, peers, nfs_name, mount, cur_open, cur
     clients[0].exec_command(
         sudo=True,
         cmd=(
-            "python3 -c \""
+            'python3 -c "'
             f"import os;p='{path}';"
             "fd=os.open(p,os.O_RDWR|os.O_CREAT,0o666);"
             "os.write(fd,b'x'*4096);os.close(fd)\""
@@ -531,7 +529,9 @@ def _run_unlock_without_close(clients, peers, nfs_name, mount, cur_open, cur_loc
     return "passed", holds
 
 
-def run_one(name, spec, clients, peers, nfs_name, mount, cur_open, cur_lock, since, test_num=0):
+def run_one(
+    name, spec, clients, peers, nfs_name, mount, cur_open, cur_lock, since, test_num=0
+):
     """Start holds for one workflow; do not kill. Return (status, holds)."""
     log.info(
         "\n==============================\n"

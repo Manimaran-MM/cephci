@@ -12,11 +12,11 @@ Kept here (integration-specific):
 
 import json
 
+from ceph.ceph import CommandFailed
 from ceph.waiter import WaitUntil
 from cli.ceph.ceph import Ceph
-from cli.utilities.filesys import Mount
-from ceph.ceph import CommandFailed
 from cli.exceptions import OperationFailedError
+from cli.utilities.filesys import Mount
 from tests.nfs.lib.tsm.helpers import wait_new_container  # noqa: F401 — re-export
 from tests.nfs.nfs_delegation_operations import create_or_replace_export_with_delegation
 from tests.nfs.nfs_operations import create_nfs_via_file_and_verify
@@ -84,7 +84,11 @@ def orch_nfs_daemons(client, nfs_name):
 
 def daemon_on_host(client, nfs_name, hostname):
     return next(
-        (d for d in orch_nfs_daemons(client, nfs_name) if d.get("hostname") == hostname),
+        (
+            d
+            for d in orch_nfs_daemons(client, nfs_name)
+            if d.get("hostname") == hostname
+        ),
         None,
     )
 
@@ -115,8 +119,15 @@ def active_mds_rank(client, fs_name="cephfs"):
 
 def mds_nfs_sessions(client, fs_name="cephfs"):
     rank = active_mds_rank(client, fs_name)
-    sessions = _json_cmd(client, f"ceph tell mds.{fs_name}:{rank} session ls --format json") or []
-    out = [s for s in sessions if "ganesha" in json.dumps(s).lower() or "nfs" in json.dumps(s).lower()]
+    sessions = (
+        _json_cmd(client, f"ceph tell mds.{fs_name}:{rank} session ls --format json")
+        or []
+    )
+    out = [
+        s
+        for s in sessions
+        if "ganesha" in json.dumps(s).lower() or "nfs" in json.dumps(s).lower()
+    ]
     log.info("MDS nfs sessions (rank %s): %s", rank, len(out))
     return out
 
@@ -184,16 +195,22 @@ def restart_nfs_daemon(client, nfs_name, hostname):
 
 
 def redeploy_nfs_daemon(client, nfs_name, hostname):
-    return _orch_daemon_action(client, nfs_name, hostname, "redeploy", wait_running=True)
+    return _orch_daemon_action(
+        client, nfs_name, hostname, "redeploy", wait_running=True
+    )
 
 
 def reapply_nfs_spec(installer, spec, nfs_nodes):
-    return create_nfs_via_file_and_verify(installer, [spec], APPLY_TIMEOUT, nfs_nodes=nfs_nodes)
+    return create_nfs_via_file_and_verify(
+        installer, [spec], APPLY_TIMEOUT, nfs_nodes=nfs_nodes
+    )
 
 
 def setup_three_exports(client, nfs_name, tag="integ"):
     group = f"tsm_integ_{tag}"
-    client.exec_command(sudo=True, cmd=f"ceph fs subvolumegroup create cephfs {group}", check_ec=False)
+    client.exec_command(
+        sudo=True, cmd=f"ceph fs subvolumegroup create cephfs {group}", check_ec=False
+    )
     exports = []
     for i in range(EXPORT_COUNT):
         sv = f"sv_{tag}_{i}"
@@ -211,7 +228,12 @@ def setup_three_exports(client, nfs_name, tag="integ"):
         pseudo = f"/export_integ_{i}"
         try:
             create_or_replace_export_with_delegation(
-                client, "cephfs", nfs_name, pseudo, path, DELEG_MODES[i],
+                client,
+                "cephfs",
+                nfs_name,
+                pseudo,
+                path,
+                DELEG_MODES[i],
                 use_cephadm=False,
             )
         except (OperationFailedError, CommandFailed) as exc:
@@ -231,8 +253,11 @@ def mount_three_exports(clients, exports, server, nfs_port, nfs_version):
         mnt = f"/mnt/integ_exp{i}"
         client.create_dirs(dir_path=mnt, sudo=True)
         if Mount(client).nfs(
-            mount=mnt, version=str(nfs_version), port=str(nfs_port),
-            server=server.hostname, export=exp["export"],
+            mount=mnt,
+            version=str(nfs_version),
+            port=str(nfs_port),
+            server=server.hostname,
+            export=exp["export"],
         ):
             return None
         mounts.append(mnt)
@@ -250,4 +275,8 @@ def teardown_three_exports(client, clients, mounts, exports):
             check_ec=False,
         )
     if group:
-        client.exec_command(sudo=True, cmd=f"ceph fs subvolumegroup rm cephfs {group} 2>/dev/null", check_ec=False)
+        client.exec_command(
+            sudo=True,
+            cmd=f"ceph fs subvolumegroup rm cephfs {group} 2>/dev/null",
+            check_ec=False,
+        )

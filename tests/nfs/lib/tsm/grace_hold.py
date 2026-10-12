@@ -1,13 +1,17 @@
 """TSM grace-period helpers (additive — safe for other TSM tests).
 
-  - enter_grace: daemon restart + wait IN GRACE (integration TC-07)
-  - hold_cluster_grace: spare open + iptables on spare client + NFS restart
-  - unblock / release: cleanup (safe to call more than once)
+- enter_grace: daemon restart + wait IN GRACE (integration TC-07)
+- hold_cluster_grace: spare open + iptables on spare client + NFS restart
+- unblock / release: cleanup (safe to call more than once)
 """
 
 import time
 
-from tests.nfs.lib.common_lib import get_nfs_container_id, get_node_time, scrape_nfs_logs
+from tests.nfs.lib.common_lib import (
+    get_nfs_container_id,
+    get_node_time,
+    scrape_nfs_logs,
+)
 from tests.nfs.lib.tsm.helpers import (
     POLL_INTERVAL,
     get_nfs_daemon_name,
@@ -109,9 +113,7 @@ def _restart_wait_in_grace(ctx, target, grace_node, label, wait_container=True):
 
     if old_cid and not wait_new_container(target, ctx.nfs_name, old_cid):
         return 1, None
-    if wait_log_pattern(
-        [grace_node], ctx.nfs_name, GRACE_IN_RE, grace_since, label
-    ):
+    if wait_log_pattern([grace_node], ctx.nfs_name, GRACE_IN_RE, grace_since, label):
         return 1, None
     return 0, grace_since
 
@@ -141,9 +143,7 @@ def wait_grace_exit(ctx, since, timeout=GRACE_TIMEOUT, node=None):
 def grace_has_exited(ctx, since, node=None):
     """True if NOT IN GRACE already logged on primary since `since`."""
     primary = node or ctx.server
-    hits = scrape_nfs_logs(
-        [primary], GRACE_OUT_RE, nfs_name=ctx.nfs_name, since=since
-    )
+    hits = scrape_nfs_logs([primary], GRACE_OUT_RE, nfs_name=ctx.nfs_name, since=since)
     return bool(hits and hits.get(primary.hostname))
 
 
@@ -241,9 +241,7 @@ def unblock_cluster_grace(ctx):
     """Remove spare-client NFS iptables only (idempotent)."""
     if not (ctx.spare_node and ctx.spare_client and ctx._iptables_active):
         return
-    iptables_nfs_block_spare(
-        ctx.spare_client, ctx.spare_node, ctx.nfs_port, add=False
-    )
+    iptables_nfs_block_spare(ctx.spare_client, ctx.spare_node, ctx.nfs_port, add=False)
     ctx._iptables_active = False
     log.info("Unblocked NFS iptables on spare client %s", ctx.spare_client.hostname)
 

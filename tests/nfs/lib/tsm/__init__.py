@@ -8,8 +8,8 @@ from tests.nfs.lib.tsm.constants import (
     TSM_FIRST_BOOT_PRESENT,
     TSM_PRIMARY_SELECTION_FAIL_ABSENT,
     TSM_PRIMARY_SELECTION_FAIL_PRESENT,
-    NfsFdHold,
     NfsFcntlLock,
+    NfsFdHold,
 )
 from tests.nfs.lib.tsm.helpers import (
     announce,
