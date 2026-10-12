@@ -1,31 +1,28 @@
 #===============================================================================================
-#---    Test Suite for NFS-Ganesha TSM (Transparent State Migration)   ---
+#---    Test Suite for NFS-Ganesha TSM — grace / open-conflict   ---
 #===============================================================================================
 # Conf: conf/tentacle/nfs/1admin-12node-4client.yaml (>=4 NFS + >=3 clients)
 #   or baremetal with >=4 NFS roles / equivalent
 #
 # Purpose:
-#   Automate NFS-Ganesha Transparent State Migration (TSM) validation.
-#   TSM syncs NFSv4 client state (opens/locks/delegations) across Ganesha peers
-#   via enable_TSM / Tsm_Port so HA/failover can reclaim state.
+#   Automate NFS-Ganesha TSM grace-period IO conflict validation.
+#   Extends grace (~90s via iptables -I) and checks open/lock/deleg reclaim
+#   behavior across Ganesha peers with a spare client holding state.
 #
 # Requirements:
-#   - >=3 NFS nodes in conf for TC-01..09 (count=3, placement hosts)
-#   - >=4 NFS nodes when TC-10 is selected (4-host pool, count=3)
-#   - Grace IO conflict (test_nfs_tsm_grace_io.py): >=4 NFS + >=3 clients
-#     (spare NFS + spare client open-hold + iptables -I for ~90s grace)
-#   - TC-08/10 reboot the mount server where clients are connected
+#   - >=4 NFS nodes (nfs_count: 4 — spare NFS + 3-daemon HA)
+#   - >=3 clients (mount clients + spare client open-hold)
 #   - Product build that renders enable_TSM / Tsm_Port in ganesha.conf
 #
 # Layout:
 #   1. Bootstrap + clients
-#   2. Basic TSM enablement (conf + listen + IO)
-#   3. Peer sync (Ceph_Nodes, ESTAB, recovery log markers)
-#   4. Record validation (steady-state open/lock counters)
-#   5. Grace IO open-conflict during extended grace — test_nfs_tsm_grace_io.py
-#   6. TSM + delegation lifecycle (open/lock/deleg peer summary — test_nfs_tsm_delegation.py)
+#   2. Grace IO open-conflict C01–C22 — test_nfs_tsm_grace_io.py
+#      (open/lock/deleg + pre-grace sticky C16–C22; NFSv4.2)
+#   3. Grace recover R01–R06 — test_nfs_tsm_grace_io.py (commented)
+#   4. Grace share-deny Rn4–DB5 — test_nfs_tsm_grace_share_deny.py (commented)
 #
-# Negative scenarios live in tier1-nfs-tsm-negative.yaml
+# Deploy / negative / record / delegation / integration live in
+# tier1-nfs-tsm-basic.yaml
 #
 #===============================================================================================
 tests:
@@ -157,31 +154,24 @@ tests:
         TC-TSM-G-C21 - IBMCEPH-19165, IBMCEPH-18586
         TC-TSM-G-C22 - IBMCEPH-19165, IBMCEPH-18586
 
-  # - test:
-  #     name: NFS TSM - Grace recover (primary restart)
-  #     module: tsm.test_nfs_tsm_grace_io.py
-  #     desc: Primary restart chain R01–R06; sticky reclaim, grace opens, write-deleg conflict
-  #     abort-on-fail: false
-  #     config:
-  #       nfs_version: "4.2"
-  #       nfs_count: 4
-  # #       workflows: ["TC-TSM-G-R01"]
+  - test:
+      name: NFS TSM - Grace recover (primary restart)
+      module: tsm.test_nfs_tsm_grace_io.py
+      desc: Primary restart chain R01–R06; sticky reclaim, grace opens, write-deleg conflict
+      abort-on-fail: false
+      config:
+        nfs_version: "4.2"
+        nfs_count: 4
+  #       workflows: ["TC-TSM-G-R01"]
 
-  # - test:
-  #     name: NFS TSM - Grace share-deny (Rn4-DB5)
-  #     module: tsm.test_nfs_tsm_grace_share_deny.py
-  #     desc: Share-deny with-deleg Rn4/Rb4/Rw4 + Wn5..DB5 (delegations=rw)
-  #     abort-on-fail: false
-  #     config:
-  #       nfs_version: "4.2"
-  #       nfs_count: 4
-  #       # workflows:
-  #       #   - "TC-TSM-G-SD-Rn4"
-  #       #   - "TC-TSM-G-SD-Rb4"
-  #       #   - "TC-TSM-G-SD-Rw4"
-  #       #   - "TC-TSM-G-SD-Wn5"
-  #       #   - "TC-TSM-G-SD-Ww5"
-  #       #   - "TC-TSM-G-SD-Dn5"
-  #       #   - "TC-TSM-G-SD-DW5"
-  #       #   - "TC-TSM-G-SD-DR5"
-  #       #   - "TC-TSM-G-SD-DB5"
+  - test:
+      name: NFS TSM - Grace share-deny (Rn4-DB5)
+      module: tsm.test_nfs_tsm_grace_share_deny.py
+      desc: Share-deny with-deleg Rn4/Rb4/Rw4 + Wn5..DB5 (delegations=rw)
+      abort-on-fail: false
+      config:
+        nfs_version: "4.2"
+        nfs_count: 4
+        # workflows:
+        #   - "TC-TSM-G-SD-Rn4"
+        #   - "TC-TSM-G-SD-Rb4"
