@@ -53,7 +53,7 @@ from tests.nfs.lib.tsm.helpers import (
     check_coredumps,
     cleanup_grace_suite,
     close_interactive,
-    collect_tsm_node_ids,
+    require_tsm_node_ids,
     ensure_deleg_export,
     file_base,
     fmt_tsm,
@@ -1728,10 +1728,7 @@ def run(ceph_cluster, **kw):
             )
 
         announce("Collect TSM Node-ids from podman logs (Ganesha ID)")
-        tsm_node_ids = collect_tsm_node_ids(active, nfs_name)
-        if len(tsm_node_ids) < len(active):
-            missing = [n.hostname for n in active if n.hostname not in tsm_node_ids]
-            raise RuntimeError(f"Missing TSM Node-id for: {missing}")
+        tsm_node_ids = require_tsm_node_ids(active, nfs_name)
 
         if _mount_clients(
             use_clients[:-1],

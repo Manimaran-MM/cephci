@@ -1,6 +1,5 @@
 """NFS TSM negative workflows."""
 
-import json
 import time
 
 from cli.utilities.packages import Package
@@ -10,7 +9,12 @@ from tests.nfs.lib.tsm.constants import (
     TSM_DISABLE_PRESENT,
     TSM_PRIMARY_SELECTION_FAIL_PRESENT,
 )
-from tests.nfs.lib.tsm.helpers import check_coredumps
+from tests.nfs.lib.tsm.helpers import (
+    check_coredumps,
+    get_nfs_daemon_name,
+    wait_new_container,
+)
+from tests.nfs.lib.tsm.integration import wait_daemon_stopped
 from tests.nfs.tsm.test_nfs_tsm_basic import (
     deploy_step,
     execute_workflows,
@@ -126,22 +130,11 @@ def _iptables_tsm(peers, recovering, port, add=True):
     return True
 
 
-def _nfs_daemon_on_host(client, nfs_name, hostname):
-    out, _ = client.exec_command(
-        sudo=True,
-        cmd=f"ceph orch ps --service_name nfs.{nfs_name} --format json",
-    )
-    daemons = json.loads(out or "[]")
-    return next((d for d in daemons if d.get("hostname") == hostname), None)
-
-
 def _daemon_cmd(client, nfs_name, hostname, action):
     """restart/stop NFS daemon on host. Returns daemon_name or None."""
-    daemon = _nfs_daemon_on_host(client, nfs_name, hostname)
-    if not daemon or not daemon.get("daemon_name"):
-        log.error("No nfs.%s daemon on %s", nfs_name, hostname)
+    name = get_nfs_daemon_name(client, nfs_name, hostname)
+    if not name:
         return None
-    name = daemon["daemon_name"]
     log.info("%s daemon %s on %s", action, name, hostname)
     client.exec_command(sudo=True, cmd=f"ceph orch daemon {action} {name} --force")
     return name
@@ -154,30 +147,6 @@ def _start_nfs_daemon(client, daemon_name):
     client.exec_command(
         sudo=True, cmd=f"ceph orch daemon start {daemon_name} --force", check_ec=False
     )
-
-
-def _wait_daemon_stopped(client, nfs_name, hostname, timeout=120):
-    for _ in range(max(1, timeout // 5)):
-        daemon = _nfs_daemon_on_host(client, nfs_name, hostname)
-        if daemon:
-            status = str(daemon.get("status_desc", "")).strip().lower()
-            if status == "stopped" or (
-                daemon.get("status") == 0 and status != "running"
-            ):
-                log.info("%s: nfs.%s stopped", hostname, nfs_name)
-                return True
-        time.sleep(5)
-    log.error("%s: timed out waiting for nfs.%s to stop", hostname, nfs_name)
-    return False
-
-
-def _wait_new_container(node, nfs_name, old_cid, timeout=120):
-    for _ in range(max(1, timeout // 2)):
-        cid = get_nfs_container_id(node, nfs_name=nfs_name)
-        if cid and cid != old_cid:
-            return cid
-        time.sleep(2)
-    return None
 
 
 def _wait_log_patterns(nodes, patterns, nfs_name, since, tries, sleep_s, label):
@@ -255,7 +224,7 @@ def run_state_retrieval_failure(
         old_cid = get_nfs_container_id(recovering, nfs_name=nfs_name)
         if not _daemon_cmd(client, nfs_name, recovering.hostname, "restart"):
             return "failed"
-        if not _wait_new_container(recovering, nfs_name, old_cid):
+        if not wait_new_container(recovering, nfs_name, old_cid):
             log.error("[%s] container not back on %s", name, recovering.hostname)
             return "failed"
 
@@ -325,13 +294,13 @@ def run_primary_selection_failure(
             if not dname:
                 return "failed"
             stopped.append(dname)
-            if not _wait_daemon_stopped(client, nfs_name, peer.hostname):
+            if not wait_daemon_stopped(client, nfs_name, peer.hostname):
                 return "failed"
 
         old_cid = get_nfs_container_id(joining, nfs_name=nfs_name)
         if not _daemon_cmd(client, nfs_name, joining.hostname, "restart"):
             return "failed"
-        if not _wait_new_container(joining, nfs_name, old_cid):
+        if not wait_new_container(joining, nfs_name, old_cid):
             log.error("[%s] container not back on %s", name, joining.hostname)
             return "failed"
 

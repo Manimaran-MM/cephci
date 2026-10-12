@@ -1,5 +1,6 @@
 """Shared TSM test helpers used by basic/record/grace/delegation workflows."""
 
+import json
 import re
 import shlex
 import time
@@ -80,6 +81,55 @@ def collect_tsm_node_ids(nodes, nfs_name):
     return mapping
 
 
+def require_tsm_node_ids(nodes, nfs_name):
+    """Collect Node-ids; raise RuntimeError if any host is missing."""
+    mapping = collect_tsm_node_ids(nodes, nfs_name)
+    missing = [n.hostname for n in nodes if n.hostname not in mapping]
+    if missing:
+        raise RuntimeError("Missing TSM Node-id for: %s" % missing)
+    return mapping
+
+
+def nid_for(ctx, node, label=""):
+    """Stable TSM Node-id from ``ctx.tsm_node_ids``, with live scrape fallback."""
+    ids = getattr(ctx, "tsm_node_ids", None)
+    if ids is None:
+        ctx.tsm_node_ids = {}
+        ids = ctx.tsm_node_ids
+    nid = ids.get(node.hostname)
+    if nid is not None:
+        return nid
+    nid = get_host_tsm_node_id(node, ctx.nfs_name)
+    if nid is not None:
+        ids[node.hostname] = nid
+        log.info("[%s] cached TSM Node-id %s=%s", label, node.hostname, nid)
+        return nid
+    log.error("[%s] no TSM Node-id for %s", label, node.hostname)
+    return None
+
+
+def resolve_server_nid(ctx, label=""):
+    """Mount-server TSM Node-id (pinned ``server_nid`` / ``mount_hostname``)."""
+    nid = getattr(ctx, "server_nid", None)
+    if nid is not None:
+        return nid
+    ids = getattr(ctx, "tsm_node_ids", None) or {}
+    mount_hn = getattr(ctx, "mount_hostname", None) or (
+        ctx.server.hostname if getattr(ctx, "server", None) else None
+    )
+    if mount_hn and mount_hn in ids:
+        if hasattr(ctx, "server_nid"):
+            ctx.server_nid = ids[mount_hn]
+        return ids[mount_hn]
+    if getattr(ctx, "server", None):
+        nid = nid_for(ctx, ctx.server, label)
+        if nid is not None and hasattr(ctx, "server_nid"):
+            ctx.server_nid = nid
+        return nid
+    log.error("[%s] no TSM Node-id for mount server %s", label, mount_hn or "<unknown>")
+    return None
+
+
 def peer_summary(peers, nfs_name, since=None, node_id=None):
     """Last peer TSM summary from ``podman logs``.
 
@@ -89,34 +139,27 @@ def peer_summary(peers, nfs_name, since=None, node_id=None):
     for node in peers:
         _, out = _podman_logs(node, nfs_name, since=since)
         lines = [ln for ln in out.splitlines() if SUMMARY_RE.search(ln)]
-
+        matched, last_m = [], None
         if node_id is not None:
-            matched, last_m = [], None
             for ln in lines:
                 nm = NODE_SUMMARY_RE.search(ln)
                 if nm and int(nm.group(1)) == int(node_id):
                     matched.append(ln)
                     last_m = nm
-            log.info(
-                "TSM record summary on %s (Node-id %s):\n%s",
-                node.hostname,
-                node_id,
-                "\n".join(matched[-3:]) if matched else "<none>",
-            )
-            if last_m:
-                _bump_counts(counts, *last_m.group(2, 3, 4, 5))
-            continue
-
+            lines = matched
         log.info(
-            "TSM record summary on %s:\n%s",
+            "TSM record summary on %s%s:\n%s",
             node.hostname,
+            " (Node-id %s)" % node_id if node_id is not None else "",
             "\n".join(lines[-3:]) if lines else "<none>",
         )
-        if not lines:
-            continue
-        m = SUMMARY_RE.search(lines[-1])
-        if m:
-            _bump_counts(counts, *m.group(1, 2, 3, 4))
+        if node_id is not None:
+            if last_m:
+                _bump_counts(counts, *last_m.group(2, 3, 4, 5))
+        elif lines:
+            m = SUMMARY_RE.search(lines[-1])
+            if m:
+                _bump_counts(counts, *m.group(1, 2, 3, 4))
     return counts
 
 
@@ -156,14 +199,85 @@ def wait_peer_counts(
 
     log.error(
         "[%s] peer summary timeout: want %s node_id=%s last=%s",
-        label,
-        want,
-        node_id,
-        last,
+        label, want, node_id, last,
     )
     if raise_on_timeout:
         raise OperationFailedError("[%s] TSM timeout want %s" % (label, want))
     return None
+
+
+def wait_counts_ok(
+    peers, nfs_name, since, expect_open, expect_lock, label,
+    expect_deleg=None, timeout=POLL_TIMEOUT, node_id=None,
+):
+    """Like ``wait_peer_counts`` but return 0 ok / 1 timeout."""
+    return (
+        0
+        if wait_peer_counts(
+            peers, nfs_name, since, expect_open, expect_lock, label,
+            expect_deleg=expect_deleg, timeout=timeout, node_id=node_id,
+        )
+        is not None
+        else 1
+    )
+
+
+def wait_server_nid_counts(
+    ctx,
+    hosts,
+    since,
+    label,
+    expect_open=None,
+    expect_lock=None,
+    expect_deleg=None,
+    timeout=POLL_TIMEOUT,
+):
+    """Wait for counts on mount-server Node-id; defaults from ``ctx.want_tsm``."""
+    w = getattr(ctx, "want_tsm", None) or {}
+    open_c = w["open"] if expect_open is None else expect_open
+    lock_c = w["lock"] if expect_lock is None else expect_lock
+    deleg_c = w.get("deleg", 0) if expect_deleg is None else expect_deleg
+    nid = resolve_server_nid(ctx, label)
+    if nid is None:
+        return None
+    return wait_peer_counts(
+        hosts, ctx.nfs_name, since, open_c, lock_c, label,
+        expect_deleg=deleg_c, timeout=timeout, node_id=nid,
+    )
+
+
+def wait_new_container(node, nfs_name, old_cid, timeout=120):
+    """Poll until NFS container id differs from ``old_cid``."""
+    for _ in range(max(1, timeout // 2)):
+        cid = get_nfs_container_id(node, nfs_name=nfs_name)
+        if cid and cid != old_cid:
+            log.info(
+                "New NFS container on %s: %s (was %s)", node.hostname, cid, old_cid
+            )
+            return cid
+        time.sleep(2)
+    log.error("Timed out waiting for new container on %s", node.hostname)
+    return None
+
+
+def get_nfs_daemon_name(client, nfs_name, hostname):
+    """Return orch daemon_name for nfs on hostname, or None."""
+    out, _ = client.exec_command(
+        sudo=True,
+        cmd="ceph orch ps --service_name nfs.%s --format json" % nfs_name,
+        check_ec=False,
+    )
+    try:
+        daemons = json.loads(out or "[]")
+    except Exception:
+        daemons = []
+    name = next(
+        (d.get("daemon_name") for d in daemons if d.get("hostname") == hostname),
+        None,
+    )
+    if not name:
+        log.error("No nfs.%s daemon on %s", nfs_name, hostname)
+    return name
 
 
 def start_bg(client, cmd):

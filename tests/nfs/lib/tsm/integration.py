@@ -2,25 +2,22 @@
 
 Reuses:
   - ``create_nfs_via_file_and_verify`` (nfs_operations) for orch apply
-  - ``create_or_replace_export_with_delegation`` (nfs_delegation_operations) for exports
-  - ``get_nfs_container_id`` (common_lib) for container checks
-  - ``Ceph`` CLI wrappers for cluster info / orch ps (same as tsm.validation)
+  - ``create_or_replace_export_with_delegation`` for exports
+  - ``wait_new_container`` (helpers) re-exported for callers
+  - ``Ceph`` CLI wrappers for cluster info / orch ps
 
-Kept here (integration-specific; no drop-in elsewhere):
-  - placement-count wait (``wait_nfs_running_count``) — not all pool hosts run NFS
-  - per-export multi-client mounts (``mount_three_exports``)
-  - MDS session checks for disruption TCs
+Kept here (integration-specific):
+  - placement-count wait, multi-export mounts, MDS session checks
 """
 
 import json
-import time
 
 from ceph.waiter import WaitUntil
 from cli.ceph.ceph import Ceph
 from cli.utilities.filesys import Mount
 from ceph.ceph import CommandFailed
 from cli.exceptions import OperationFailedError
-from tests.nfs.lib.common_lib import get_nfs_container_id
+from tests.nfs.lib.tsm.helpers import wait_new_container  # noqa: F401 — re-export
 from tests.nfs.nfs_delegation_operations import create_or_replace_export_with_delegation
 from tests.nfs.nfs_operations import create_nfs_via_file_and_verify
 from utility.log import Log
@@ -154,13 +151,15 @@ def wait_daemon_running(client, nfs_name, hostname, timeout=DAEMON_WAIT_TIMEOUT)
     return False
 
 
-def wait_new_container(node, nfs_name, old_cid, timeout=120):
-    for _ in range(max(1, timeout // 2)):
-        cid = get_nfs_container_id(node, nfs_name=nfs_name)
-        if cid and cid != old_cid:
-            return cid
-        time.sleep(2)
-    return None
+def wait_daemon_stopped(client, nfs_name, hostname, timeout=120):
+    for _ in WaitUntil(timeout=timeout, interval=5):
+        d = daemon_on_host(client, nfs_name, hostname)
+        if not d:
+            return True
+        status = str(d.get("status_desc", "")).strip().lower()
+        if status == "stopped" or (d.get("status") == 0 and status != "running"):
+            return True
+    return False
 
 
 def _orch_daemon_action(client, nfs_name, hostname, action, *, wait_running=False):

@@ -21,7 +21,7 @@ from tests.nfs.lib.tsm.helpers import (
     mount_clients as _mount_clients,
     peer_summary as _peer_summary,
     start_bg as _bg,
-    wait_peer_counts,
+    wait_counts_ok as _wait_counts,
 )
 from tests.nfs.tsm.test_nfs_tsm_basic import deploy_step, safe_cleanup
 from utility.log import Log
@@ -364,18 +364,6 @@ WORKFLOWS = {
         "custom": "unlock_without_close",
     },
 }
-
-
-def _wait_counts(peers, nfs_name, since, expect_open, expect_lock, label):
-    """Poll until last summary open/lock match expected. Return 0 ok, 1 timeout."""
-    return (
-        0
-        if wait_peer_counts(
-            peers, nfs_name, since, expect_open, expect_lock, label
-        )
-        is not None
-        else 1
-    )
 
 
 def _fmt(cmd, mount):

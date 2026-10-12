@@ -5,11 +5,14 @@
   - unblock / release: cleanup (safe to call more than once)
 """
 
-import json
 import time
 
 from tests.nfs.lib.common_lib import get_nfs_container_id, get_node_time, scrape_nfs_logs
-from tests.nfs.lib.tsm.helpers import POLL_INTERVAL
+from tests.nfs.lib.tsm.helpers import (
+    POLL_INTERVAL,
+    get_nfs_daemon_name,
+    wait_new_container,
+)
 from utility.log import Log
 
 log = Log(__name__)
@@ -17,7 +20,6 @@ log = Log(__name__)
 GRACE_IN_RE = r"NFS Server Now IN GRACE"
 GRACE_OUT_RE = r"NFS Server Now NOT IN GRACE"
 GRACE_TIMEOUT = 120
-CONTAINER_TIMEOUT = 120
 
 
 class GraceCtx:
@@ -73,32 +75,6 @@ class GraceCtx:
         return self.clients[1] if len(self.clients) > 1 else None
 
 
-def _nfs_daemon_name(client, nfs_name, hostname):
-    out, _ = client.exec_command(
-        sudo=True,
-        cmd=f"ceph orch ps --service_name nfs.{nfs_name} --format json",
-    )
-    daemons = json.loads(out or "[]")
-    daemon = next((d for d in daemons if d.get("hostname") == hostname), None)
-    name = (daemon or {}).get("daemon_name")
-    if not name:
-        log.error("No nfs.%s daemon on %s", nfs_name, hostname)
-    return name
-
-
-def wait_new_container(node, nfs_name, old_cid, timeout=CONTAINER_TIMEOUT):
-    for _ in range(max(1, timeout // 2)):
-        cid = get_nfs_container_id(node, nfs_name=nfs_name)
-        if cid and cid != old_cid:
-            log.info(
-                "New NFS container on %s: %s (was %s)", node.hostname, cid, old_cid
-            )
-            return cid
-        time.sleep(2)
-    log.error("Timed out waiting for new container on %s", node.hostname)
-    return None
-
-
 def wait_log_pattern(nodes, nfs_name, pattern, since, label, timeout=GRACE_TIMEOUT):
     """Wait until scrape_nfs_logs finds pattern on any node. 0 ok, 1 timeout."""
     deadline = time.time() + timeout
@@ -121,7 +97,7 @@ def _restart_wait_in_grace(ctx, target, grace_node, label, wait_container=True):
     old_cid = (
         get_nfs_container_id(target, nfs_name=ctx.nfs_name) if wait_container else None
     )
-    daemon_name = _nfs_daemon_name(ctx.client_a, ctx.nfs_name, target.hostname)
+    daemon_name = get_nfs_daemon_name(ctx.client_a, ctx.nfs_name, target.hostname)
     if not daemon_name:
         return 1, None
 

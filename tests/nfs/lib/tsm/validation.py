@@ -280,108 +280,50 @@ class NfsTsmValidation:
         return 0
 
     def assert_tsm_disable_logs(self, nfs_name, node, peers=None, since=None):
-        """Return 0 if disable markers match on recovering node (and peers if set).
-
-        Recovering ``node``: TSM_DISABLE_PRESENT + TSM_DISABLE_ABSENT.
-        ``peers`` (if given and TSM_DISABLE_PEER_PRESENT non-empty): each peer
-        must match those patterns.
-        """
+        """Return 0 if disable markers match on recovering node (and peers if set)."""
         log.info("TSM DISABLE-PATH LOG VALIDATION (%s on %s)", nfs_name, node.hostname)
-        for pat in TSM_DISABLE_PRESENT:
-            if (
-                scrape_nfs_logs(
-                    [node], pat, nfs_name=nfs_name, require_match=True, since=since
-                )
-                is None
-            ):
-                return 1
-        for pat in TSM_DISABLE_ABSENT:
-            if (
-                scrape_nfs_logs(
-                    [node], pat, nfs_name=nfs_name, require_absent=True, since=since
-                )
-                is None
-            ):
-                return 1
-        log.info("%s: TSM disable path ok", node.hostname)
-
+        if self._assert_boot_path(
+            node, nfs_name, TSM_DISABLE_PRESENT, TSM_DISABLE_ABSENT, since, "disable"
+        ):
+            return 1
         if peers and TSM_DISABLE_PEER_PRESENT:
             peer_list = peers if isinstance(peers, (list, tuple)) else [peers]
-            log.info(
-                "TSM disable peer markers on: %s",
-                [p.hostname for p in peer_list],
-            )
             for pat in TSM_DISABLE_PEER_PRESENT:
                 if (
                     scrape_nfs_logs(
-                        peer_list,
-                        pat,
-                        nfs_name=nfs_name,
-                        require_match=True,
-                        since=since,
+                        peer_list, pat, nfs_name=nfs_name,
+                        require_match=True, since=since,
                     )
                     is None
                 ):
                     return 1
-            log.info("peers: TSM disable notify/cleanup ok")
         return 0
 
     def assert_tsm_primary_selection_fail_logs(self, nfs_name, node, since=None):
         """Return 0 if all-peers-down disable markers match (no partial primary)."""
         log.info(
             "TSM PRIMARY-SELECTION-FAIL LOG VALIDATION (%s on %s)",
-            nfs_name,
-            node.hostname,
+            nfs_name, node.hostname,
         )
-        for pat in TSM_PRIMARY_SELECTION_FAIL_PRESENT:
-            if (
-                scrape_nfs_logs(
-                    [node], pat, nfs_name=nfs_name, require_match=True, since=since
-                )
-                is None
-            ):
-                return 1
-        for pat in TSM_PRIMARY_SELECTION_FAIL_ABSENT:
-            if (
-                scrape_nfs_logs(
-                    [node], pat, nfs_name=nfs_name, require_absent=True, since=since
-                )
-                is None
-            ):
-                return 1
-        log.info("%s: TSM primary-selection-fail path ok", node.hostname)
-        return 0
+        return self._assert_boot_path(
+            node,
+            nfs_name,
+            TSM_PRIMARY_SELECTION_FAIL_PRESENT,
+            TSM_PRIMARY_SELECTION_FAIL_ABSENT,
+            since,
+            "primary-selection-fail",
+        )
 
     def assert_tsm_boot_logs(self, nfs_name, nfs_nodes, since=None):
-        """All NFS nodes must show first-boot INFO markers after initial bring-up.
-
-        Matches ``test_nfs_tsm_basic`` deploy path (before debug enable). Expects
-        on every node:
-          TSM thread is initialized, TSM_PEER_RECORD_FIRST_BOOT_DONE,
-          Total cluster size.
-        Does not forbid recovery/reaper strings — those can appear after
-        peer selection on a healthy first boot.
-        Returns 0 on success, 1 on failure.
-        """
+        """All NFS nodes must show first-boot INFO markers after initial bring-up."""
         log.info("TSM BOOT-PATH LOG VALIDATION (%s)", nfs_name)
-        ok_hosts = []
         for node in nfs_nodes:
-            if (
-                self._assert_boot_path(
-                    node,
-                    nfs_name,
-                    TSM_FIRST_BOOT_PRESENT,
-                    (),
-                    since,
-                    "first-boot",
-                )
-                != 0
+            if self._assert_boot_path(
+                node, nfs_name, TSM_FIRST_BOOT_PRESENT, (), since, "first-boot"
             ):
                 log.error("%s: missing first-boot TSM logs", node.hostname)
                 return 1
-            ok_hosts.append(node.hostname)
-
-        log.info("TSM boot roles: all first_boot=%s", ok_hosts)
+        log.info("TSM boot roles: all first_boot=%s", [n.hostname for n in nfs_nodes])
         return 0
 
     def assert_tsm_ready(

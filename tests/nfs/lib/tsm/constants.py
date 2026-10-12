@@ -100,23 +100,20 @@ class NfsFcntlLock:
     @staticmethod
     def _hold_cmd(path, lock_type, start=0, length=0, flags="os.O_RDWR|os.O_CREAT", seed=False):
         """Hold lock until SIGTERM/SIGINT → explicit F_UNLCK then close."""
-        if "O_CREAT" in flags:
-            open_stmt = f"fd=os.open(path,{flags},0o644);"
-        else:
-            open_stmt = f"fd=os.open(path,{flags});"
-        seed_stmt = (
-            "os.write(fd,b'x'*4096) if os.fstat(fd).st_size==0 else None;"
-            if seed
-            else ""
+        open_stmt = (
+            f"fd=os.open(path,{flags},0o644);"
+            if "O_CREAT" in flags
+            else f"fd=os.open(path,{flags});"
         )
-        # length 0 == whole file (POSIX); else byte-range
+        seed_stmt = (
+            "os.write(fd,b'x'*4096) if os.fstat(fd).st_size==0 else None;" if seed else ""
+        )
         return (
             "python3 -c \""
             "import fcntl,os,struct,signal,sys;"
             f"path='{path}';start={int(start)};length={int(length)};"
             "pack=lambda t:struct.pack('hhqqq',t,os.SEEK_SET,start,length,0);"
-            f"{open_stmt}"
-            f"{seed_stmt}"
+            f"{open_stmt}{seed_stmt}"
             f"fcntl.fcntl(fd,fcntl.F_SETLKW,pack({lock_type}));"
             "print('LOCKED pid=%s'%os.getpid(),flush=True);"
             "u=lambda *a:(fcntl.fcntl(fd,fcntl.F_SETLK,pack(fcntl.F_UNLCK)),"
