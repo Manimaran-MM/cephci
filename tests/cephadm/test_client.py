@@ -8,10 +8,40 @@ from ceph.parallel import parallel
 from ceph.utils import get_node_by_id
 from cephci.utils.build_info import CephTestManifest
 from cli.utilities.configure import setup_ibm_licence
+from cli.utilities.utils import reboot_node
 from utility import utils
 from utility.log import Log
 
 log = Log(__name__)
+
+_OPENSSL_RPM_URLS = (
+    "http://magna002.ceph.redhat.com/ceph-qe-logs/hemanth_kumar/openssl_packages/"
+    "openssl-devel-3.5.7-1.el9.x86_64.rpm",
+    "http://magna002.ceph.redhat.com/ceph-qe-logs/hemanth_kumar/openssl_packages/"
+    "openssl-libs-3.5.7-1.el9.x86_64.rpm",
+    "https://magna002.ceph.redhat.com/ceph-qe-logs/hemanth_kumar/openssl_packages/"
+    "openssl-3.5.7-1.el9.x86_64.rpm",
+)
+
+
+def _install_openssl_packages(node) -> None:
+    """Download magna OpenSSL RPMs, localinstall, and reboot before ceph-common."""
+    workdir = "/tmp/openssl_packages"
+    node.exec_command(sudo=True, cmd=f"rm -rf {workdir} && mkdir -p {workdir}")
+    for url in _OPENSSL_RPM_URLS:
+        node.exec_command(
+            sudo=True,
+            cmd=f"wget --no-check-certificate -P {workdir} {url}",
+            long_running=True,
+            check_ec=True,
+        )
+    node.exec_command(
+        sudo=True,
+        cmd=f"bash -c 'cd {workdir} && dnf localinstall -y *'",
+        long_running=True,
+        check_ec=True,
+    )
+    reboot_node(node)
 
 
 def add(cls, config: Dict) -> None:
@@ -195,6 +225,8 @@ def add(cls, config: Dict) -> None:
                 _manifest = manifest_obj or cls.config.get("manifest")
                 if _manifest and _manifest.product == "ibm":
                     setup_ibm_licence(_node, build_type=_manifest.build_type)
+
+                _install_openssl_packages(_node)
 
                 for pkg in config.get("install_packages"):
                     if _rpm_version:
