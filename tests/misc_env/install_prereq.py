@@ -630,6 +630,9 @@ def set_latest_installed_kernel_default(ceph):
     CDN package installs can register an older kernel as the next boot default.
     Prefer the highest installed NEVRA so the subsequent reboot uses the newest
     kernel already present on disk (e.g. from the cloud image).
+
+    Also verify matching kernel-modules / kernel-modules-core for that version and
+    attempt to install matching kernel-modules-extra when available from repos.
     """
     cmd = (
         "rpm -q kernel-core --qf '%{VERSION}-%{RELEASE}.%{ARCH}\\n' "
@@ -641,6 +644,43 @@ def set_latest_installed_kernel_default(ceph):
         raise ConfigError(
             f"{ceph.hostname}: no kernel-core package found to set as default"
         )
+
+    for pkg in (f"kernel-modules-core-{latest}", f"kernel-modules-{latest}"):
+        out, err = ceph.exec_command(sudo=True, cmd=f"rpm -q {pkg}", check_ec=False)
+        result = f"{out} {err}".strip()
+        if "is not installed" in result.lower() or not out.strip():
+            raise ConfigError(
+                f"{ceph.hostname}: required package {pkg} is not installed "
+                f"for selected kernel {latest}"
+            )
+        log.info(f"{ceph.hostname}: found matching package {out.strip()}")
+
+    extras_pkg = f"kernel-modules-extra-{latest}"
+    out, err = ceph.exec_command(sudo=True, cmd=f"rpm -q {extras_pkg}", check_ec=False)
+    result = f"{out} {err}".strip()
+    if "is not installed" in result.lower() or not out.strip():
+        log.info(
+            f"{ceph.hostname}: installing matching {extras_pkg} if available in repos"
+        )
+        ceph.exec_command(
+            sudo=True,
+            cmd=f"dnf install -y {extras_pkg}",
+            check_ec=False,
+            long_running=True,
+        )
+        verify_out, verify_err = ceph.exec_command(
+            sudo=True, cmd=f"rpm -q {extras_pkg}", check_ec=False
+        )
+        verify = f"{verify_out} {verify_err}".strip()
+        if "is not installed" in verify.lower() or not verify_out.strip():
+            log.warning(
+                f"{ceph.hostname}: {extras_pkg} not available/installed from repos; "
+                f"continuing with default kernel {latest}"
+            )
+        else:
+            log.info(f"{ceph.hostname}: installed {verify_out.strip()}")
+    else:
+        log.info(f"{ceph.hostname}: found matching package {out.strip()}")
 
     vmlinuz_path = f"/boot/vmlinuz-{latest}"
     ceph.exec_command(sudo=True, cmd=f"test -e {vmlinuz_path}")
