@@ -320,13 +320,211 @@ def create_test_file(client, path, size_mb=64):
     log.info("Source file created: %s", (out or "").strip())
 
 
-def copy_within_export(client, src, dst):
-    """Copy src -> dst on the same NFS mount (intra-export, fs == fs)."""
-    announce(f"Intra-export cp {src} -> {dst} on {client.hostname}")
+def _timed_cp(client, src, dst):
+    """
+    Run ``cp src dst`` and return wall-clock seconds (remote ``date``).
+
+    ``rm -f dst`` is done first and not included in the elapsed time.
+    """
     client.exec_command(sudo=True, cmd=f"rm -f {dst}")
-    client.exec_command(sudo=True, cmd=f"cp {src} {dst}", timeout=600)
+    # Measure on the client host so SSH RTT is not counted as copy time.
+    out, _ = client.exec_command(
+        sudo=True,
+        cmd=(
+            f"start=$(date +%s.%N); cp {src} {dst} && end=$(date +%s.%N) && "
+            f"awk -v s=\"$start\" -v e=\"$end\" 'BEGIN {{ printf \"%.3f\\n\", e - s }}'"
+        ),
+        timeout=600,
+    )
+    elapsed = float((out or "0").strip().splitlines()[-1])
+    log.info("cp elapsed: %.3fs (%s -> %s)", elapsed, src, dst)
     out, _ = client.exec_command(sudo=True, cmd=f"ls -lh {src} {dst}")
     log.info("After copy:\n%s", (out or "").strip())
+    return elapsed
+
+
+def copy_within_export(client, src, dst):
+    """Copy src -> dst on the same NFS mount (intra-export, fs == fs).
+
+    Returns elapsed seconds for the ``cp`` itself.
+    """
+    announce(f"Intra-export cp {src} -> {dst} on {client.hostname}")
+    return _timed_cp(client, src, dst)
+
+
+def copy_across_exports(client, src, dst):
+    """Copy src -> dst across two NFS mounts (cross-export, fs1 != fs2).
+
+    Returns elapsed seconds for the ``cp`` itself.
+    """
+    announce(f"Cross-export cp {src} -> {dst} on {client.hostname}")
+    return _timed_cp(client, src, dst)
+
+
+def create_xcopy_subvolumes(
+    client,
+    fs_name="cephfs",
+    group="xcopygroup",
+    names=("xcopy_sv_a", "xcopy_sv_b"),
+):
+    """
+    Create CephFS subvolumes for cross-export testing.
+
+    Returns list of dicts: name, group, path, fs_name.
+    """
+    announce(f"Create CephFS subvolumes {list(names)} in group {group}")
+    client.exec_command(
+        sudo=True,
+        cmd=f"ceph fs subvolumegroup create {fs_name} {group}",
+        check_ec=False,
+    )
+    results = []
+    for name in names:
+        client.exec_command(
+            sudo=True,
+            cmd=(
+                f"ceph fs subvolume create {fs_name} {name} "
+                f"--group_name {group} --namespace-isolated"
+            ),
+            check_ec=False,
+        )
+        out, _ = client.exec_command(
+            sudo=True,
+            cmd=f"ceph fs subvolume getpath {fs_name} {name} --group_name {group}",
+        )
+        path = (out or "").strip()
+        if not path:
+            raise RuntimeError(
+                f"Empty subvolume path for {name} (fs={fs_name} group={group})"
+            )
+        log.info("Subvolume %s path=%s", name, path)
+        results.append(
+            {"name": name, "group": group, "path": path, "fs_name": fs_name}
+        )
+    return results
+
+
+def _host_fsal_user_id(conf_text, default="admin"):
+    """Return FSAL User_Id from the first EXPORT block, if present."""
+    m = re.search(
+        r"EXPORT\s*\{.*?FSAL\s*\{.*?User_Id\s*=\s*\"?([^\";\s]+)\"?\s*;",
+        conf_text or "",
+        flags=re.S | re.I,
+    )
+    if m:
+        return m.group(1)
+    return default
+
+
+def _export_block(export_id, path, pseudo, user_id="admin"):
+    """Return a host-Ganesha EXPORT block for a CephFS path."""
+    return (
+        "EXPORT {\n"
+        f"  Export_Id = {int(export_id)};\n"
+        f'  Path = "{path}";\n'
+        f'  Pseudo = "{pseudo}";\n'
+        "  Access_Type = RW;\n"
+        "  Squash = None;\n"
+        "  Attr_Expiration_Time = 0;\n"
+        "  Protocols = 3,4;\n"
+        "  Transports = TCP;\n"
+        "  FSAL {\n"
+        "    Name = CEPH;\n"
+        f'    User_Id = "{user_id}";\n'
+        "  }\n"
+        "}\n"
+    )
+
+
+def _strip_export_blocks(conf_text):
+    """Remove EXPORT { ... } blocks, respecting nested braces (e.g. FSAL)."""
+    text = conf_text or ""
+    out = []
+    i = 0
+    while i < len(text):
+        m = re.search(r"(?i)\bEXPORT\s*\{", text[i:])
+        if not m:
+            out.append(text[i:])
+            break
+        start = i + m.start()
+        out.append(text[i:start])
+        brace = i + m.end() - 1  # '{'
+        depth = 0
+        j = brace
+        while j < len(text):
+            if text[j] == "{":
+                depth += 1
+            elif text[j] == "}":
+                depth -= 1
+                if depth == 0:
+                    j += 1
+                    break
+            j += 1
+        i = j
+    return "".join(out)
+
+
+def ensure_host_cross_exports(
+    node,
+    exports,
+    conf_path=HOST_GANESHA_CONF,
+    restart=True,
+):
+    """
+    Community: replace EXPORT blocks with one Pseudo/Path pair per subvolume.
+
+    ``exports`` is a list of dicts with keys: export_id, path, pseudo.
+    Preserves LOG / NFS_CORE_PARAM / NFSv4 / CEPH blocks.
+    """
+    announce(f"Ensure {len(exports)} host EXPORT block(s) on {node.hostname}")
+    if len(exports) < 2:
+        raise RuntimeError("Cross-export setup needs at least two EXPORT entries")
+
+    out, _ = node.exec_command(sudo=True, cmd=f"cat {conf_path}")
+    text = out or ""
+    if not text.strip():
+        raise RuntimeError(f"Empty or missing ganesha conf: {conf_path}")
+
+    user_id = _host_fsal_user_id(text)
+    log.info("Using FSAL User_Id=%s for new EXPORT blocks", user_id)
+
+    stripped = _strip_export_blocks(text)
+    stripped = re.sub(r"\n{3,}", "\n\n", stripped).rstrip() + "\n\n"
+
+    blocks = []
+    for exp in exports:
+        blocks.append(
+            _export_block(
+                exp["export_id"],
+                exp["path"],
+                exp["pseudo"],
+                user_id=user_id,
+            )
+        )
+        log.info(
+            "EXPORT Export_Id=%s Path=%s Pseudo=%s",
+            exp["export_id"],
+            exp["path"],
+            exp["pseudo"],
+        )
+    new_text = stripped + "\n".join(blocks)
+
+    tmp = "/tmp/ganesha_xcopy_cross.conf"
+    remote = node.remote_file(sudo=True, file_name=tmp, file_mode="w")
+    remote.write(new_text)
+    remote.flush()
+    node.exec_command(sudo=True, cmd=f"cp -f {tmp} {conf_path}")
+
+    out, _ = node.exec_command(sudo=True, cmd=f"cat {conf_path}")
+    log.info("Final ganesha.conf (%s):\n%s", conf_path, (out or "").strip())
+
+    if restart:
+        announce(f"Restart nfs-ganesha on {node.hostname}")
+        node.exec_command(
+            sudo=True, cmd="systemctl restart nfs-ganesha", timeout=120
+        )
+        out, _ = node.exec_command(sudo=True, cmd="systemctl is-active nfs-ganesha")
+        log.info("nfs-ganesha is-active: %s", (out or "").strip())
 
 
 def verify_files_match(client, src, dst):
@@ -344,6 +542,35 @@ def verify_files_match(client, src, dst):
         log.info("ls after cmp fail:\n%s", (out or "").strip())
         return False
     log.info("PASS: files match (%s == %s)", src, dst)
+    return True
+
+
+def verify_files_shasum(client, src, dst):
+    """Return True if sha256 digests of src and dst match."""
+    announce(f"Verify data integrity: sha256sum {src} {dst}")
+    out, _ = client.exec_command(
+        sudo=True, cmd=f"sha256sum {src} {dst}", timeout=600
+    )
+    text = (out or "").strip()
+    log.info("sha256sum:\n%s", text if text else "<empty>")
+    hashes = []
+    for line in text.splitlines():
+        parts = line.split()
+        if parts:
+            hashes.append(parts[0].lower())
+    if len(hashes) < 2:
+        log.error("Could not parse two sha256 digests from sha256sum output")
+        return False
+    if hashes[0] != hashes[1]:
+        log.error(
+            "SHA mismatch: %s (%s) vs %s (%s)",
+            hashes[0],
+            src,
+            hashes[1],
+            dst,
+        )
+        return False
+    log.info("PASS: sha256 match (%s)", hashes[0])
     return True
 
 

@@ -2,8 +2,9 @@
 # NFS-Ganesha xcopy / COPY offload (NFSv4.2)
 # Conf: conf/tentacle/nfs/1admin-7node-3client.yaml (or equivalent)
 #
-# Scenarios:
-#   - Intra-Export SYNC Copy Offload (fs == fs)
+# Scenarios (cases in xcopy.test_nfs_xcopy_intra_export_sync):
+#   - XCOPY-01 Intra-Export SYNC Copy Offload (fs == fs)
+#   - XCOPY-02 Cross-Export SYNC Copy Offload (fs1 != fs2)
 #===============================================================================================
 tests:
   # - test:
@@ -129,35 +130,18 @@ tests:
   #     name: configure client
 
   - test:
-      name: Intra-Export SYNC Copy Offload (fs == fs)
+      name: Server-Side Copy (XCOPY) Core Operations & Scenarios
       module: xcopy.test_nfs_xcopy_intra_export_sync.py
-      desc: >
-        Same export / same FSAL — create a file and copy within the mount;
-        verify data integrity, tcpdump/capinfos/tshark (COPY + low data),
-        xcopy log milestones, and chunk-size math against
-        Copy_Offload_Chunk_Size. Community skips cephadm deploy and uses
-        host /etc/ganesha/ganesha.conf + /var/log/ganesha/ganesha.log.
+      desc: Verify core xcopy operations and scenarios.
       abort-on-fail: false
       config:
-        # Cases in this module (add more names as cases are implemented):
-        #   - intra_export_copy_offload_on
         test_cases:
           - intra_export_copy_offload_on
+          - cross_export_copy_offload_on
         nfs_version: "4.2"
         clients: 1
         # 128 MiB / 64 MiB chunk => 2 chunks (enough for math); keeps run fast.
         file_size_mb: 128
         chunk_size_mb: 64
-        # Linux cp often uses protocol ASYNC + CB_OFFLOAD; both are server-side
-        # offload. Set to "sync" / "async" to require that mode only.
-        copy_mode: any
-        # Community host-Ganesha only (ignored for cephadm):
-        nfs_mount: /mnt/nfs
-        export_pseudo: /cephfs
-        ganesha_log_path: /var/log/ganesha/ganesha.log
-        # Client-side pcap during cp (installs tcpdump/wireshark-cli if needed).
-        # ON: packets tens, data KB–low MB, opcode 60 yes, 25/38 == 0.
-        # OFF: packets tens of thousands, data ≈ 2× file, 25/38 flood yes.
-        pcap_validate: true
-        pcap_path: /tmp/nfs-xcopy-cp.pcap
-        pcap_offload_enabled: true
+      comments: |
+        XCOPY-02 (cross_export_copy_offload_on) - IBMCEPH-21037
