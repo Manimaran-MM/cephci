@@ -3,8 +3,9 @@
 # Conf: conf/tentacle/nfs/1admin-7node-3client.yaml (or equivalent)
 #
 # Scenarios (cases in xcopy.test_nfs_xcopy_intra_export_sync):
-#   - XCOPY-01 Intra-Export SYNC Copy Offload (fs == fs)
-#   - XCOPY-02 Cross-Export SYNC Copy Offload (fs1 != fs2)
+#   - XCOPY-01 Intra-Export Copy Offload (fs == fs)
+#   - XCOPY-02 Cross-Export Copy Offload (fs1 != fs2)
+#   - XCOPY-03 Large File ASYNC Copy Offload (2 GiB, mode=async)
 #===============================================================================================
 tests:
   # - test:
@@ -137,11 +138,14 @@ tests:
       config:
         test_cases:
           - intra_export_copy_offload_on
-          - cross_export_copy_offload_on
+          # - cross_export_copy_offload_on
+          - large_file_async_copy_offload_on
         nfs_version: "4.2"
         clients: 1
         # 128 MiB / 64 MiB chunk => 2 chunks (enough for math); keeps run fast.
+        # XCOPY-03 uses large_file_size_mb (default 2048) instead.
         file_size_mb: 128
         chunk_size_mb: 64
+        large_file_size_mb: 2048
       comments: |
         XCOPY-02 (cross_export_copy_offload_on) - IBMCEPH-21037

@@ -2,8 +2,9 @@
 NFS-Ganesha xcopy / COPY offload cases (shared community/cephadm setup).
 
 Cases:
-  1) intra_export_copy_offload_on  — XCOPY-01 (fs == fs)
-  2) cross_export_copy_offload_on  — XCOPY-02 (fs1 != fs2)
+  1) intra_export_copy_offload_on       — XCOPY-01 (fs == fs)
+  2) cross_export_copy_offload_on       — XCOPY-02 (fs1 != fs2)
+  3) large_file_async_copy_offload_on   — XCOPY-03 (large file, ASYNC)
 
 Each case runs its workload, then a grouped validation sequence.
 
@@ -42,6 +43,7 @@ from tests.nfs.lib.xcopy import (
     create_xcopy_subvolumes,
     ensure_copy_offload,
     ensure_host_cross_exports,
+    ensure_host_intra_export,
     ganesha_log_line_mark,
     is_community_product,
     mount_host_export,
@@ -257,10 +259,19 @@ def _setup_cluster(ctx):
                 "Community path: skip cephadm deploy/export/debug; "
                 "use host ganesha.conf + ganesha.log"
             )
+            # restart=False: ensure_host_intra_export rewrites EXPORT and restarts.
+            # Clears leftover /cephfs_a,/cephfs_b from a prior cross-export run.
             configure_host_ganesha_xcopy(
                 ganesha_node,
                 enabled=True,
                 chunk_size_mb=ctx["chunk_size_mb"],
+                restart=False,
+            )
+            ensure_host_intra_export(
+                ganesha_node,
+                path="/",
+                pseudo=ctx["export_pseudo"],
+                restart=True,
             )
             mount_host_export(
                 client,
@@ -485,6 +496,21 @@ def _default_validations():
     ]
 
 
+def _apply_case_file_params(ctx, size_mb=None, copy_mode=None):
+    """Override per-case file size / required COPY mode for validations."""
+    if size_mb is not None:
+        ctx["size_mb"] = int(size_mb)
+        ctx["file_size_bytes"] = ctx["size_mb"] * 1024 * 1024
+        log.info(
+            "Case file size override: %s MiB (%s bytes)",
+            ctx["size_mb"],
+            ctx["file_size_bytes"],
+        )
+    if copy_mode is not None:
+        ctx["copy_mode"] = copy_mode
+        log.info("Case copy_mode override: %s", ctx["copy_mode"])
+
+
 def _run_copy_with_pcap(ctx, copy_fn):
     """Create source, optionally capture pcap around copy_fn(client, src, dst)."""
     client = ctx["client"]
@@ -562,9 +588,31 @@ def case_cross_export_copy_offload_on(ctx):
     announce("PASS CASE: cross_export_copy_offload_on")
 
 
+def case_large_file_async_copy_offload_on(ctx):
+    """
+    XCOPY-03: Large-file Copy_Offload — expect ASYNC OP_COPY + CB_OFFLOAD.
+
+    Same mount as XCOPY-01 (intra-export). Default size 2 GiB (override via
+    config large_file_size_mb). Same validations as XCOPY-01/02, but Ganesha
+    log check requires mode=async (state token, worker, CB_OFFLOAD).
+    """
+    announce("================================================")
+    announce("CASE: large_file_async_copy_offload_on (XCOPY-03)")
+    announce("================================================")
+    size_mb = int(ctx["config"].get("large_file_size_mb", 2048))
+    _apply_case_file_params(ctx, size_mb=size_mb, copy_mode="async")
+    ctx["src"] = f"{ctx['nfs_mount_a']}/xcopy_async_src.bin"
+    ctx["dst"] = f"{ctx['nfs_mount_a']}/xcopy_async_dst.bin"
+
+    _run_copy_with_pcap(ctx, copy_within_export)
+    _run_validations(ctx, _default_validations())
+    announce("PASS CASE: large_file_async_copy_offload_on")
+
+
 CASES = {
     "intra_export_copy_offload_on": case_intra_export_copy_offload_on,
     "cross_export_copy_offload_on": case_cross_export_copy_offload_on,
+    "large_file_async_copy_offload_on": case_large_file_async_copy_offload_on,
 }
 
 

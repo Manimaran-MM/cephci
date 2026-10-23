@@ -464,21 +464,21 @@ def _strip_export_blocks(conf_text):
     return "".join(out)
 
 
-def ensure_host_cross_exports(
+def ensure_host_exports(
     node,
     exports,
     conf_path=HOST_GANESHA_CONF,
     restart=True,
 ):
     """
-    Community: replace EXPORT blocks with one Pseudo/Path pair per subvolume.
+    Community: replace EXPORT blocks with the given Pseudo/Path list.
 
     ``exports`` is a list of dicts with keys: export_id, path, pseudo.
     Preserves LOG / NFS_CORE_PARAM / NFSv4 / CEPH blocks.
     """
     announce(f"Ensure {len(exports)} host EXPORT block(s) on {node.hostname}")
-    if len(exports) < 2:
-        raise RuntimeError("Cross-export setup needs at least two EXPORT entries")
+    if not exports:
+        raise RuntimeError("ensure_host_exports requires at least one EXPORT entry")
 
     out, _ = node.exec_command(sudo=True, cmd=f"cat {conf_path}")
     text = out or ""
@@ -525,6 +525,45 @@ def ensure_host_cross_exports(
         )
         out, _ = node.exec_command(sudo=True, cmd="systemctl is-active nfs-ganesha")
         log.info("nfs-ganesha is-active: %s", (out or "").strip())
+
+
+def ensure_host_cross_exports(
+    node,
+    exports,
+    conf_path=HOST_GANESHA_CONF,
+    restart=True,
+):
+    """Community cross-export: require >=2 EXPORT blocks, then rewrite conf."""
+    if len(exports) < 2:
+        raise RuntimeError("Cross-export setup needs at least two EXPORT entries")
+    return ensure_host_exports(
+        node, exports, conf_path=conf_path, restart=restart
+    )
+
+
+def ensure_host_intra_export(
+    node,
+    path="/",
+    pseudo="/cephfs",
+    export_id=1,
+    conf_path=HOST_GANESHA_CONF,
+    restart=True,
+):
+    """
+    Community intra-export: force a single EXPORT (default Pseudo /cephfs).
+
+    Clears leftover dual-export Pseudos (e.g. /cephfs_a, /cephfs_b) from a
+    prior cross-export run so mount of /cephfs succeeds.
+    """
+    announce(
+        f"Ensure single host EXPORT Pseudo={pseudo} Path={path} on {node.hostname}"
+    )
+    return ensure_host_exports(
+        node,
+        [{"export_id": export_id, "path": path, "pseudo": pseudo}],
+        conf_path=conf_path,
+        restart=restart,
+    )
 
 
 def verify_files_match(client, src, dst):
