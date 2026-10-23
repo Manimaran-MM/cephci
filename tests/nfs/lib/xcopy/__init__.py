@@ -7,8 +7,10 @@ from tests.nfs.lib.xcopy.helpers import (
     configure_host_ganesha_xcopy,
     copy_across_exports,
     copy_within_export,
+    create_sparse_test_file,
     create_test_file,
     create_xcopy_subvolumes,
+    sparse_file_layout,
     ensure_copy_offload,
     ensure_host_cross_exports,
     ensure_host_intra_export,
@@ -22,6 +24,7 @@ from tests.nfs.lib.xcopy.helpers import (
     verify_copy_offload_logs,
     verify_files_match,
     verify_files_shasum,
+    verify_sparse_holes_preserved,
     verify_xcopy_pcap,
 )
 
@@ -32,8 +35,10 @@ __all__ = [
     "configure_host_ganesha_xcopy",
     "copy_across_exports",
     "copy_within_export",
+    "create_sparse_test_file",
     "create_test_file",
     "create_xcopy_subvolumes",
+    "sparse_file_layout",
     "ensure_copy_offload",
     "ensure_host_cross_exports",
     "ensure_host_intra_export",
@@ -47,5 +52,6 @@ __all__ = [
     "verify_copy_offload_logs",
     "verify_files_match",
     "verify_files_shasum",
+    "verify_sparse_holes_preserved",
     "verify_xcopy_pcap",
 ]

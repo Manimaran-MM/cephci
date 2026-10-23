@@ -6,6 +6,8 @@ Cases:
   2) cross_export_copy_offload_on       — XCOPY-02 (fs1 != fs2)
   3) large_file_async_copy_offload_on   — XCOPY-03 (large file, ASYNC)
   4) short_copy_offload_on              — XCOPY-04 (Short_Copy=ON packaging)
+  5) sparse_file_copy_offload           — XCOPY-05 (sparse src + offload/content)
+  6) sparse_hole_preservation           — XCOPY-06 (zero-hole + fill-dst probe)
 
 Each case runs its workload, then a grouped validation sequence.
 
@@ -40,6 +42,7 @@ from tests.nfs.lib.xcopy import (
     configure_host_ganesha_xcopy,
     copy_across_exports,
     copy_within_export,
+    create_sparse_test_file,
     create_test_file,
     create_xcopy_subvolumes,
     ensure_copy_offload,
@@ -53,6 +56,7 @@ from tests.nfs.lib.xcopy import (
     verify_copy_offload_logs,
     verify_files_match,
     verify_files_shasum,
+    verify_sparse_holes_preserved,
     verify_xcopy_pcap,
 )
 from tests.nfs.lib.xcopy.helpers import announce
@@ -412,6 +416,20 @@ def _validate_shasum(ctx):
     return True
 
 
+def _validate_sparse_holes(ctx):
+    """XCOPY-06: hole ranges stay zeros; fill dst holes; src must stay zeros."""
+    if not verify_sparse_holes_preserved(
+        ctx["client"],
+        ctx["src"],
+        ctx["dst"],
+        size_mb=ctx["size_mb"],
+    ):
+        raise OperationFailedError(
+            f"Sparse holes not preserved after copy ({ctx['src']} vs {ctx['dst']})"
+        )
+    return True
+
+
 def _validate_copy_elapsed(ctx):
     """Report wall-clock seconds captured for the cp operation."""
     elapsed = ctx.get("copy_elapsed_sec")
@@ -542,6 +560,20 @@ def _default_validations():
     ]
 
 
+def _sparse_copy_validations():
+    """XCOPY-05: content + offload only (no hole-map assert)."""
+    return _default_validations()
+
+
+def _sparse_hole_validations():
+    """XCOPY-06: content + hole zero/fill independence probe."""
+    return [
+        ("data_integrity_cmp", _validate_data_integrity),
+        ("data_integrity_shasum", _validate_shasum),
+        ("sparse_holes_preserved", _validate_sparse_holes),
+    ]
+
+
 def _apply_case_file_params(ctx, size_mb=None, copy_mode=None):
     """Override per-case file size / required COPY mode for validations."""
     if size_mb is not None:
@@ -557,12 +589,12 @@ def _apply_case_file_params(ctx, size_mb=None, copy_mode=None):
         log.info("Case copy_mode override: %s", ctx["copy_mode"])
 
 
-def _run_copy_with_pcap(ctx, copy_fn):
+def _run_copy_with_pcap(ctx, copy_fn, create_fn=None):
     """Create source, optionally capture pcap around copy_fn(client, src, dst)."""
     client = ctx["client"]
     src, dst = ctx["src"], ctx["dst"]
     _mark_logs(ctx)
-    create_test_file(client, src, size_mb=ctx["size_mb"])
+    (create_fn or create_test_file)(client, src, size_mb=ctx["size_mb"])
 
     tcpdump_pid = None
     if ctx["pcap_validate"]:
@@ -683,11 +715,57 @@ def case_short_copy_offload_on(ctx):
     announce("PASS CASE: short_copy_offload_on")
 
 
+def _run_sparse_copy(ctx, src_name, dst_name):
+    """Shared sparse create + intra-export cp (Copy_Offload ON, Short_Copy OFF)."""
+    ctx["short_copy"] = False
+    ctx["src"] = f"{ctx['nfs_mount_a']}/{src_name}"
+    ctx["dst"] = f"{ctx['nfs_mount_a']}/{dst_name}"
+    _run_copy_with_pcap(
+        ctx, copy_within_export, create_fn=create_sparse_test_file
+    )
+
+
+def case_sparse_file_copy_offload(ctx):
+    """
+    XCOPY-05: Sparse source + server-side COPY (content / offload).
+
+    Create via truncate + partial writes, intra-export cp, then the same
+    validations as XCOPY-01 (cmp, sha256, elapsed, pcap, ganesha logs).
+    Does not assert hole maps (see sparse_hole_preservation).
+    """
+    announce("================================================")
+    announce("CASE: sparse_file_copy_offload (XCOPY-05)")
+    announce("================================================")
+    _run_sparse_copy(ctx, "xcopy_sparse_src.bin", "xcopy_sparse_dst.bin")
+    _run_validations(ctx, _sparse_copy_validations())
+    announce("PASS CASE: sparse_file_copy_offload")
+
+
+def case_sparse_hole_preservation(ctx):
+    """
+    XCOPY-06: Hole preservation after server-side COPY.
+
+    Same sparse create + cp as XCOPY-05, then cmp/sha256, then for each known
+    hole range: confirm zeros on src/dst, write a fill pattern into dst only,
+    and require src holes stay zeros while dst matches the fill. No SEEK helper.
+    """
+    announce("================================================")
+    announce("CASE: sparse_hole_preservation (XCOPY-06)")
+    announce("================================================")
+    _run_sparse_copy(
+        ctx, "xcopy_sparse_hole_src.bin", "xcopy_sparse_hole_dst.bin"
+    )
+    _run_validations(ctx, _sparse_hole_validations())
+    announce("PASS CASE: sparse_hole_preservation")
+
+
 CASES = {
     "intra_export_copy_offload_on": case_intra_export_copy_offload_on,
     "cross_export_copy_offload_on": case_cross_export_copy_offload_on,
     "large_file_async_copy_offload_on": case_large_file_async_copy_offload_on,
     "short_copy_offload_on": case_short_copy_offload_on,
+    "sparse_file_copy_offload": case_sparse_file_copy_offload,
+    "sparse_hole_preservation": case_sparse_hole_preservation,
 }
 
 

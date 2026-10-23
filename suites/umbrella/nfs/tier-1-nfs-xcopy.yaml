@@ -141,12 +141,15 @@ tests:
           # - intra_export_copy_offload_on
           # # - cross_export_copy_offload_on
           # - large_file_async_copy_offload_on
-          - short_copy_offload_on
+          # - short_copy_offload_on
+          # - sparse_file_copy_offload
+          - sparse_hole_preservation
         nfs_version: "4.2"
         clients: 1
         # 128 MiB / 64 MiB chunk => 2 chunks (enough for math); keeps run fast.
         # XCOPY-03 uses large_file_size_mb (default 2048) instead.
         # XCOPY-04 needs file_size > chunk_size to see per-chunk CB_OFFLOAD.
+        # XCOPY-05/06: same logical size; sparse via truncate + partial writes.
         file_size_mb: 128
         chunk_size_mb: 64
         large_file_size_mb: 2048

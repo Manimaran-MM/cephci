@@ -333,6 +333,71 @@ def create_test_file(client, path, size_mb=64):
     log.info("Source file created: %s", (out or "").strip())
 
 
+def sparse_file_layout(size_mb=128, island_mb=8):
+    """
+    Return (data_ranges, hole_ranges) in MiB for the XCOPY sparse layout.
+
+    data: three islands at 0, 32, and size_mb-16.
+    holes: gaps between / after those islands.
+    """
+    size_mb = int(size_mb)
+    island_mb = int(island_mb)
+    if size_mb < 64:
+        raise ValueError(f"sparse layout needs size_mb >= 64 (got {size_mb})")
+    mid = 32
+    end = size_mb - (2 * island_mb)
+    data = [
+        (0, island_mb),
+        (mid, island_mb),
+        (end, island_mb),
+    ]
+    holes = [
+        (island_mb, mid - island_mb),
+        (mid + island_mb, end - (mid + island_mb)),
+        (end + island_mb, size_mb - (end + island_mb)),
+    ]
+    holes = [(off, length) for off, length in holes if length > 0]
+    return data, holes
+
+
+def create_sparse_test_file(client, path, size_mb=128):
+    """
+    Create a sparse file via truncate + partial writes (XCOPY-05/06).
+
+    Simple layout (no fallocate):
+      1) truncate to logical size_mb (file starts as one hole)
+      2) write three 8 MiB data islands at 0, 32 MiB, and size_mb-16 MiB
+
+    Unwritten ranges between islands are the "holes" (read as zeros).
+    """
+    size_mb = int(size_mb)
+    data_ranges, hole_ranges = sparse_file_layout(size_mb)
+    announce(
+        f"Create sparse source {path} (logical={size_mb} MiB, "
+        f"data={data_ranges}, holes={hole_ranges}) on {client.hostname}"
+    )
+    client.exec_command(sudo=True, cmd=f"mkdir -p $(dirname {path})")
+    client.exec_command(sudo=True, cmd=f"rm -f {path}")
+    client.exec_command(sudo=True, cmd=f"truncate -s {size_mb}M {path}")
+    for seek, island_mb in data_ranges:
+        client.exec_command(
+            sudo=True,
+            cmd=(
+                f"dd if=/dev/urandom of={path} bs=1M count={island_mb} "
+                f"seek={seek} conv=notrunc status=none"
+            ),
+            timeout=600,
+        )
+    out, _ = client.exec_command(
+        sudo=True,
+        cmd=(
+            f"stat -c 'logical=%s blocks=%b block_size=%B' {path}; "
+            f"du -h {path}; du -h --apparent-size {path}; ls -lh {path}"
+        ),
+    )
+    log.info("Sparse source created:\n%s", (out or "").strip())
+
+
 def _timed_cp(client, src, dst):
     """
     Run ``cp src dst`` and return wall-clock seconds (remote ``date``).
@@ -623,6 +688,120 @@ def verify_files_shasum(client, src, dst):
         )
         return False
     log.info("PASS: sha256 match (%s)", hashes[0])
+    return True
+
+
+def _range_is_zeros(client, path, offset_mb, length_mb):
+    """Return True if [offset_mb, offset_mb+length_mb) in path is all zeros."""
+    # Must use cmp -n: plain ``cmp - /dev/zero`` returns 1 on EOF even when
+    # the stream was all zeros (/dev/zero never ends).
+    nbytes = int(length_mb) * 1024 * 1024
+    client.exec_command(
+        sudo=True,
+        cmd=(
+            f"dd if={path} bs=1M skip={int(offset_mb)} count={int(length_mb)} "
+            f"status=none | cmp -s -n {nbytes} - /dev/zero"
+        ),
+        check_ec=False,
+        timeout=600,
+    )
+    return client.exit_status == 0
+
+
+def verify_sparse_holes_preserved(client, src, dst, size_mb=128):
+    """
+    Return True if post-COPY hole regions behave correctly (XCOPY-06).
+
+    No SEEK / Python helper. For each known hole range:
+
+      1) src and dst hole bytes must still read as zeros
+      2) write a known fill pattern into that range on **dst** only
+      3) src hole range must remain zeros (copy did not share/corrupt src)
+      4) dst hole range must match the fill pattern
+
+    If a hole was not independently preserved (e.g. dst write affects src, or
+    hole region was not zero after copy), the case fails.
+    """
+    size_mb = int(size_mb)
+    _, hole_ranges = sparse_file_layout(size_mb)
+    announce(
+        f"Verify sparse holes preserved via fill probe: {src} vs {dst} "
+        f"(holes_mib={hole_ranges})"
+    )
+    fill_path = "/tmp/xcopy_hole_fill.bin"
+    # One MiB known pattern reused for every hole probe write.
+    client.exec_command(
+        sudo=True,
+        cmd=(
+            f"dd if=/dev/urandom of={fill_path} bs=1M count=1 status=none"
+        ),
+    )
+
+    for offset_mb, length_mb in hole_ranges:
+        log.info(
+            "Hole range probe: offset=%sMiB length=%sMiB",
+            offset_mb,
+            length_mb,
+        )
+        if not _range_is_zeros(client, src, offset_mb, length_mb):
+            log.error(
+                "src hole range not zeros after copy (offset=%sMiB len=%sMiB)",
+                offset_mb,
+                length_mb,
+            )
+            return False
+        if not _range_is_zeros(client, dst, offset_mb, length_mb):
+            log.error(
+                "dst hole range not zeros after copy (offset=%sMiB len=%sMiB)",
+                offset_mb,
+                length_mb,
+            )
+            return False
+
+        # Fill only the first 1 MiB of the hole on dst (enough to detect sharing).
+        probe_mb = 1 if length_mb >= 1 else length_mb
+        client.exec_command(
+            sudo=True,
+            cmd=(
+                f"dd if={fill_path} of={dst} bs=1M seek={offset_mb} "
+                f"count={probe_mb} conv=notrunc status=none"
+            ),
+            timeout=600,
+        )
+
+        # Src must be unchanged (still zeros in the hole).
+        if not _range_is_zeros(client, src, offset_mb, probe_mb):
+            log.error(
+                "src hole changed after writing fill into dst "
+                "(offset=%sMiB) — hole/copy independence failed",
+                offset_mb,
+            )
+            return False
+
+        # Dst must now contain the fill pattern in the probed window.
+        client.exec_command(
+            sudo=True,
+            cmd=(
+                f"dd if={dst} bs=1M skip={offset_mb} count={probe_mb} "
+                f"status=none | cmp -s - {fill_path}"
+            ),
+            check_ec=False,
+            timeout=600,
+        )
+        if client.exit_status != 0:
+            log.error(
+                "dst hole range did not keep fill pattern (offset=%sMiB)",
+                offset_mb,
+            )
+            return False
+        log.info(
+            "PASS hole range offset=%sMiB: zeros after copy; "
+            "dst fill ok; src still zeros",
+            offset_mb,
+        )
+
+    client.exec_command(sudo=True, cmd=f"rm -f {fill_path}", check_ec=False)
+    log.info("PASS: sparse hole fill probes succeeded for all hole ranges")
     return True
 
 
