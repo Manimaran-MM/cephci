@@ -102,16 +102,20 @@ def ensure_copy_offload(
     nfs_name,
     enabled=True,
     chunk_size_mb=64,
+    short_copy=False,
     conf_file="nfs_xcopy.conf",
 ):
     """Cephadm path: set Copy_Offload via ``ceph nfs cluster config set``."""
     announce(f"Cephadm: set Copy_Offload on nfs.{nfs_name}")
     flag = "true" if enabled else "false"
+    short_flag = "true" if short_copy else "false"
     chunk_bytes = int(chunk_size_mb) * 1024 * 1024
     log.info(
-        "Building conf %s: Copy_Offload=%s Chunk_Size=%s (%s MiB) for nfs.%s",
+        "Building conf %s: Copy_Offload=%s Short_Copy=%s Chunk_Size=%s (%s MiB) "
+        "for nfs.%s",
         conf_file,
         flag,
+        short_flag,
         chunk_bytes,
         chunk_size_mb,
         nfs_name,
@@ -119,6 +123,7 @@ def ensure_copy_offload(
     body = (
         "NFSv4 {\n"
         f"\tCopy_Offload = {flag};\n"
+        f"\tShort_Copy = {short_flag};\n"
         f"\tCopy_Offload_Chunk_Size = {chunk_bytes};\n"
         "}\n"
     )
@@ -131,8 +136,10 @@ def ensure_copy_offload(
         sudo=True, cmd=f"ceph nfs cluster config set {nfs_name} -i {conf_file}"
     )
     log.info(
-        "Applied Copy_Offload=%s Copy_Offload_Chunk_Size=%s (%s MiB) on nfs.%s",
+        "Applied Copy_Offload=%s Short_Copy=%s Copy_Offload_Chunk_Size=%s (%s MiB) "
+        "on nfs.%s",
         flag,
+        short_flag,
         chunk_bytes,
         chunk_size_mb,
         nfs_name,
@@ -178,6 +185,7 @@ def configure_host_ganesha_xcopy(
     node,
     enabled=True,
     chunk_size_mb=64,
+    short_copy=False,
     conf_path=HOST_GANESHA_CONF,
     restart=True,
 ):
@@ -187,11 +195,14 @@ def configure_host_ganesha_xcopy(
     """
     announce(f"Configure host ganesha.conf on {node.hostname}")
     flag = "true" if enabled else "false"
+    short_flag = "true" if short_copy else "false"
     chunk_bytes = int(chunk_size_mb) * 1024 * 1024
     log.info(
-        "Target conf=%s enabled=%s chunk_size_mb=%s restart=%s host=%s",
+        "Target conf=%s enabled=%s short_copy=%s chunk_size_mb=%s restart=%s "
+        "host=%s",
         conf_path,
         flag,
+        short_flag,
         chunk_size_mb,
         restart,
         node.hostname,
@@ -231,6 +242,7 @@ def configure_host_ganesha_xcopy(
         log.info("COMPONENTS block not present; leaving LOG block as-is")
 
     text = _set_or_insert_nfsv4_key(text, "Copy_Offload", flag)
+    text = _set_or_insert_nfsv4_key(text, "Short_Copy", short_flag)
     text = _set_or_insert_nfsv4_key(text, "Copy_Offload_Chunk_Size", str(chunk_bytes))
 
     tmp = "/tmp/ganesha_xcopy.conf"
@@ -240,9 +252,10 @@ def configure_host_ganesha_xcopy(
     remote.flush()
     node.exec_command(sudo=True, cmd=f"cp -f {tmp} {conf_path}")
     log.info(
-        "Wrote %s: Copy_Offload=%s Copy_Offload_Chunk_Size=%s (%s MiB)",
+        "Wrote %s: Copy_Offload=%s Short_Copy=%s Copy_Offload_Chunk_Size=%s (%s MiB)",
         conf_path,
         flag,
+        short_flag,
         chunk_bytes,
         chunk_size_mb,
     )
@@ -1127,40 +1140,213 @@ def _log_matched_lines(label, log_text, pattern, limit=5):
     return hits
 
 
-def validate_xcopy_logs(
+def _validate_xcopy_logs_short_copy(
     log_text,
     file_size_bytes,
     chunk_size_bytes,
     mode="any",
 ):
     """
+    Short_Copy=ON packaging: CB_OFFLOAD after each chunk-sized piece.
+
+    Observed behaviour (multi-chunk file):
+      - multiple ASYNC worker jobs / CB_OFFLOAD lines
+      - each CB bytes == chunk length (last may be remainder)
+      - sum(CB bytes) == file_size
+    """
+    announce("Validate Short_Copy=ON packaging (per-chunk CB_OFFLOAD)")
+    expected = _expected_chunks(int(file_size_bytes), int(chunk_size_bytes))
+    expected_n = len(expected)
+    announce(
+        f"Step: Short_Copy plan — {expected_n} chunk(s), "
+        f"expect exactly {expected_n} START / CB_OFFLOAD / mdcache"
+    )
+    for exp_idx, exp_off, exp_len, _ in expected:
+        log.info(
+            "  expected piece #%s: src_off=%s len=%s",
+            exp_idx,
+            exp_off,
+            exp_len,
+        )
+
+    starts = list(RE_WORKER_START.finditer(log_text))
+    log.info(
+        "Found %s worker START match(es), expected %s", len(starts), expected_n
+    )
+    if not starts:
+        log.error("Short_Copy: no COPY SYNC|ASYNC worker START in logs")
+        return False
+
+    detected = starts[0].group(1).upper()
+    logged_chunk = int(starts[0].group(5))
+    log.info("Evidence first START:\n%s", starts[0].group(0))
+    if mode != "any" and detected.lower() != mode.lower():
+        log.error("Expected copy mode %s but logs show %s", mode, detected)
+        return False
+    log.info("PASS: mode=%s (required=%s)", detected, mode)
+
+    if logged_chunk != int(chunk_size_bytes):
+        log.error(
+            "Logged chunk_size=%s does not match Copy_Offload_Chunk_Size=%s",
+            logged_chunk,
+            chunk_size_bytes,
+        )
+        return False
+    log.info("PASS: chunk_size=%s", logged_chunk)
+
+    if len(starts) != expected_n:
+        log.error(
+            "Short_Copy: found %s worker START(s), expected exactly %s "
+            "(one job per chunk)",
+            len(starts),
+            expected_n,
+        )
+        return False
+    log.info("PASS: worker START count=%s == %s", len(starts), expected_n)
+
+    if detected == "ASYNC":
+        announce("Step: ASYNC milestones (offload state / submit / CB_OFFLOAD)")
+        state_hits = _log_matched_lines(
+            "create_copy_offload_state", log_text, RE_OFFLOAD_STATE.pattern
+        )
+        if not state_hits:
+            log.warning(
+                "Short_Copy ASYNC: create_copy_offload_state missing (continuing)"
+            )
+        else:
+            log.info("PASS: create_copy_offload_state present")
+
+        submit_hits = _log_matched_lines(
+            "copy_submit_job", log_text, RE_SUBMIT_JOB.pattern
+        )
+        if not submit_hits:
+            log.warning("Short_Copy ASYNC: copy_submit_job missing (continuing)")
+        else:
+            log.info("PASS: copy_submit_job present")
+
+    cb = list(RE_CB_OFFLOAD.finditer(log_text))
+    log.info(
+        "Found %s CB_OFFLOAD sending OK match(es), expected %s",
+        len(cb),
+        expected_n,
+    )
+    if len(cb) != expected_n:
+        log.error(
+            "Short_Copy: found %s CB_OFFLOAD, expected exactly %s (one per chunk)",
+            len(cb),
+            expected_n,
+        )
+        return False
+
+    cb_sizes = []
+    for i, hit in enumerate(cb):
+        nbytes = int(hit.group(1))
+        cb_sizes.append(nbytes)
+        exp_len = expected[i][2]
+        log.info("Evidence CB #%s:\n%s", i, hit.group(0))
+        if nbytes != exp_len:
+            log.error(
+                "Short_Copy: CB #%s bytes=%s, expected chunk len=%s",
+                i,
+                nbytes,
+                exp_len,
+            )
+            return False
+        log.info("PASS CB #%s: bytes=%s == chunk len", i, nbytes)
+
+    if sum(cb_sizes) != int(file_size_bytes):
+        log.error(
+            "Short_Copy: sum(CB bytes)=%s != file_size=%s",
+            sum(cb_sizes),
+            file_size_bytes,
+        )
+        return False
+    log.info(
+        "PASS: sum(CB bytes)=%s == file_size (per-chunk completion, not one final CB)",
+        sum(cb_sizes),
+    )
+
+    md_hits = list(RE_MDCACHE_OK.finditer(log_text))
+    log.info(
+        "Found %s mdcache done OK line(s), expected %s",
+        len(md_hits),
+        expected_n,
+    )
+    if len(md_hits) != expected_n:
+        log.error(
+            "Short_Copy: found %s mdcache done OK, expected exactly %s",
+            len(md_hits),
+            expected_n,
+        )
+        return False
+    for exp_idx, _, exp_len, _ in expected:
+        got = int(md_hits[exp_idx].group(1))
+        log.info("Evidence mdcache #%s:\n%s", exp_idx, md_hits[exp_idx].group(0))
+        if got != exp_len:
+            log.error(
+                "Short_Copy: mdcache #%s copied=%s, expected %s",
+                exp_idx,
+                got,
+                exp_len,
+            )
+            return False
+        log.info("PASS mdcache #%s: copied=%s", exp_idx, got)
+
+    announce(
+        f"PASS Short_Copy log validation: mode={detected} "
+        f"file_size={file_size_bytes} chunk_size={logged_chunk} "
+        f"cb_count={expected_n}"
+    )
+    return True
+
+
+def validate_xcopy_logs(
+    log_text,
+    file_size_bytes,
+    chunk_size_bytes,
+    mode="any",
+    short_copy=False,
+):
+    """
     Validate xcopy milestones and chunk arithmetic from Ganesha logs.
 
-    Checks (async path):
-      - create_copy_offload_state / copy_submit_job
-      - COPY ASYNC worker START (total, chunk_size)
-      - per-chunk src_off / len / progress
-      - mdcache done OK copied sizes
-      - CB_OFFLOAD sending OK bytes == total
+    short_copy=False (default, Short_Copy=OFF):
+      - one worker START with total == file_size, src_off=dst_off=0
+      - chunk #0..N-1 under that job
+      - one CB_OFFLOAD with bytes == file_size (ASYNC)
 
-    Checks (sync path):
-      - COPY SYNC worker START + chunk lines (no offload state / CB required)
+    short_copy=True (Short_Copy=ON):
+      - per-chunk completion: exactly N CB_OFFLOAD, each == chunk len
+      - sum(CB bytes) == file_size
+      - exactly N worker START / mdcache done OK
 
     mode: sync | async | any
     Returns True on success.
     """
-    announce("Validate xcopy milestones + chunk math from Ganesha logs")
+    announce(
+        "Validate xcopy milestones + chunk math from Ganesha logs "
+        f"(Short_Copy={'ON' if short_copy else 'OFF'})"
+    )
     log.info(
         "Inputs: expected_total=%s expected_chunk_size=%s required_mode=%s "
-        "log_bytes=%s",
+        "short_copy=%s log_bytes=%s",
         file_size_bytes,
         chunk_size_bytes,
         mode,
+        short_copy,
         len(log_text or ""),
     )
     if not log_text or not log_text.strip():
         log.error("Empty Ganesha logs; cannot validate xcopy")
         return False
+
+    if short_copy:
+        return _validate_xcopy_logs_short_copy(
+            log_text,
+            file_size_bytes=file_size_bytes,
+            chunk_size_bytes=chunk_size_bytes,
+            mode=mode,
+        )
 
     announce("Step: find COPY SYNC|ASYNC worker START")
     starts = list(RE_WORKER_START.finditer(log_text))
@@ -1170,13 +1356,26 @@ def validate_xcopy_logs(
         _log_matched_lines("COPY/xcopy hints", log_text, r"COPY |xcopy|CB_OFFLOAD", 20)
         return False
 
-    start = starts[-1]
+    # Prefer a START whose total matches the full file (Short_Copy=OFF packaging).
+    start = None
+    for cand in reversed(starts):
+        if int(cand.group(2)) == int(file_size_bytes):
+            start = cand
+            break
+    if start is None:
+        start = starts[-1]
+        log.warning(
+            "No worker START with total==file_size; using last START "
+            "(total=%s file_size=%s)",
+            start.group(2),
+            file_size_bytes,
+        )
     detected = start.group(1).upper()
     total = int(start.group(2))
     src_off0 = int(start.group(3))
     dst_off0 = int(start.group(4))
     logged_chunk = int(start.group(5))
-    log.info("Using last worker START match (of %s)", len(starts))
+    log.info("Using worker START match for Short_Copy=OFF path")
     log.info("Evidence line:\n%s", start.group(0))
     log.info(
         "Parsed worker START: mode=%s total=%s src_off=%s dst_off=%s chunk_size=%s",
@@ -1254,14 +1453,21 @@ def validate_xcopy_logs(
         if not cb:
             log.error("ASYNC path missing CB_OFFLOAD: sending OK")
             return False
-        cb_bytes = int(cb[-1].group(1))
-        log.info("Evidence line:\n%s", cb[-1].group(0))
-        if cb_bytes != total:
+        # Short_Copy=OFF: one final CB with bytes == full file size.
+        full_cbs = [m for m in cb if int(m.group(1)) == total]
+        if not full_cbs:
             log.error(
-                "CB_OFFLOAD bytes=%s does not match total=%s", cb_bytes, total
+                "Short_Copy=OFF: no CB_OFFLOAD with bytes==file_size (%s); "
+                "saw %s",
+                total,
+                [int(m.group(1)) for m in cb],
             )
             return False
-        log.info("PASS: CB_OFFLOAD bytes=%s == total", cb_bytes)
+        log.info("Evidence line:\n%s", full_cbs[-1].group(0))
+        log.info(
+            "PASS: CB_OFFLOAD bytes=%s == total (single completion at end)",
+            total,
+        )
     else:
         announce("Step: SYNC milestones (no CB_OFFLOAD required)")
         if RE_CB_OFFLOAD.search(log_text):
@@ -1279,9 +1485,11 @@ def validate_xcopy_logs(
     after = log_text[start.start() :]
     chunk_hits = list(chunk_re.finditer(after))
     log.info("Found %s chunk log line(s), expected %s", len(chunk_hits), expected_n)
-    if len(chunk_hits) < expected_n:
+    if len(chunk_hits) != expected_n:
         log.error(
-            "Found %s chunk log lines, expected %s", len(chunk_hits), expected_n
+            "Found %s chunk log lines, expected exactly %s",
+            len(chunk_hits),
+            expected_n,
         )
         return False
 
@@ -1328,13 +1536,13 @@ def validate_xcopy_logs(
     announce("Step: validate mdcache done OK copied= sizes")
     md_hits = list(RE_MDCACHE_OK.finditer(after))
     log.info(
-        "Found %s mdcache done OK line(s), expected >= %s",
+        "Found %s mdcache done OK line(s), expected %s",
         len(md_hits),
         expected_n,
     )
-    if len(md_hits) < expected_n:
+    if len(md_hits) != expected_n:
         log.error(
-            "Found %s mdcache done OK lines, expected >= %s",
+            "Found %s mdcache done OK lines, expected exactly %s",
             len(md_hits),
             expected_n,
         )
@@ -1354,10 +1562,11 @@ def validate_xcopy_logs(
 
     announce(
         f"PASS xcopy log validation: mode={detected} total={total} "
-        f"chunk_size={logged_chunk} chunks={expected_n}"
+        f"chunk_size={logged_chunk} chunks={expected_n} Short_Copy=OFF"
     )
     log.info(
-        "xcopy validation summary: mode=%s total=%s chunk_size=%s chunks=%s",
+        "xcopy validation summary: mode=%s total=%s chunk_size=%s chunks=%s "
+        "short_copy=False",
         detected,
         total,
         logged_chunk,
@@ -1376,19 +1585,23 @@ def verify_copy_offload_logs(
     community=False,
     ganesha_log_path=HOST_GANESHA_LOG,
     log_from_line=0,
+    short_copy=False,
 ):
     """
     Collect logs and validate xcopy milestones + chunk math.
 
     community=True  -> ``/var/log/ganesha/ganesha.log`` on the Ganesha host
     community=False -> podman logs (cephadm), same pattern as TSM helpers
+    short_copy      -> Short_Copy=ON per-chunk CB packaging vs OFF single CB
     """
     log.info(
         "verify_copy_offload_logs: community=%s nfs_name=%s mode=%s "
-        "file_size_bytes=%s chunk_size_bytes=%s since=%s log_from_line=%s",
+        "short_copy=%s file_size_bytes=%s chunk_size_bytes=%s since=%s "
+        "log_from_line=%s",
         community,
         nfs_name,
         mode,
+        short_copy,
         file_size_bytes,
         chunk_size_bytes,
         since,
@@ -1419,6 +1632,7 @@ def verify_copy_offload_logs(
         file_size_bytes=file_size_bytes,
         chunk_size_bytes=chunk_size_bytes,
         mode=mode,
+        short_copy=short_copy,
     )
     log.info("verify_copy_offload_logs result: %s", "PASS" if ok else "FAIL")
     return ok

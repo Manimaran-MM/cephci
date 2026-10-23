@@ -5,6 +5,7 @@ Cases:
   1) intra_export_copy_offload_on       — XCOPY-01 (fs == fs)
   2) cross_export_copy_offload_on       — XCOPY-02 (fs1 != fs2)
   3) large_file_async_copy_offload_on   — XCOPY-03 (large file, ASYNC)
+  4) short_copy_offload_on              — XCOPY-04 (Short_Copy=ON packaging)
 
 Each case runs its workload, then a grouped validation sequence.
 
@@ -177,6 +178,7 @@ def _build_ctx(ceph_cluster, config, case_names):
         "src": None,
         "dst": None,
         "copy_elapsed_sec": None,
+        "short_copy": False,
         "file_size_bytes": size_mb * 1024 * 1024,
         "chunk_size_bytes": chunk_size_mb * 1024 * 1024,
         "log_since": None,
@@ -446,7 +448,8 @@ def _validate_pcap(ctx):
 
 
 def _validate_ganesha_logs(ctx):
-    """Ganesha log milestones + chunk-size math."""
+    """Ganesha log milestones + chunk-size / Short_Copy packaging math."""
+    short_copy = bool(ctx.get("short_copy"))
     if not verify_copy_offload_logs(
         ctx["nfs_nodes_for_logs"],
         ctx["nfs_name"],
@@ -457,14 +460,57 @@ def _validate_ganesha_logs(ctx):
         community=ctx["community"],
         ganesha_log_path=ctx["ganesha_log_path"],
         log_from_line=ctx["log_from_line"],
+        short_copy=short_copy,
     ):
         raise OperationFailedError(
             "xcopy log / chunk-size validation failed "
             f"(product={'community' if ctx['community'] else 'cephadm'}, "
-            f"mode={ctx['copy_mode']}, size={ctx['size_mb']}MiB, "
-            f"chunk={ctx['chunk_size_mb']}MiB)"
+            f"mode={ctx['copy_mode']}, short_copy={short_copy}, "
+            f"size={ctx['size_mb']}MiB, chunk={ctx['chunk_size_mb']}MiB)"
         )
     return True
+
+
+def _enable_short_copy(ctx):
+    """Turn Short_Copy=true (restart / remount as needed) for XCOPY-04."""
+    announce("Enable Short_Copy=true for XCOPY-04")
+    ctx["short_copy"] = True
+    if ctx["community"]:
+        configure_host_ganesha_xcopy(
+            ctx["ganesha_node"],
+            enabled=True,
+            chunk_size_mb=ctx["chunk_size_mb"],
+            short_copy=True,
+            restart=True,
+        )
+        # Restart drops client mounts; remount primary (and secondary if cross).
+        mount_host_export(
+            ctx["client"],
+            ctx["ganesha_node"],
+            nfs_mount=ctx["nfs_mount_a"],
+            export_pseudo=(
+                ctx["export_pseudo_a"] if ctx["need_cross"] else ctx["export_pseudo"]
+            ),
+            version=ctx["version"],
+            port=ctx["port"],
+        )
+        if ctx["need_cross"]:
+            mount_host_export(
+                ctx["client"],
+                ctx["ganesha_node"],
+                nfs_mount=ctx["nfs_mount_b"],
+                export_pseudo=ctx["export_pseudo_b"],
+                version=ctx["version"],
+                port=ctx["port"],
+            )
+    else:
+        ensure_copy_offload(
+            ctx["client"],
+            ctx["nfs_name"],
+            enabled=True,
+            chunk_size_mb=ctx["chunk_size_mb"],
+            short_copy=True,
+        )
 
 
 def _run_validations(ctx, validations):
@@ -601,6 +647,7 @@ def case_large_file_async_copy_offload_on(ctx):
     announce("================================================")
     size_mb = int(ctx["config"].get("large_file_size_mb", 2048))
     _apply_case_file_params(ctx, size_mb=size_mb, copy_mode="async")
+    ctx["short_copy"] = False
     ctx["src"] = f"{ctx['nfs_mount_a']}/xcopy_async_src.bin"
     ctx["dst"] = f"{ctx['nfs_mount_a']}/xcopy_async_dst.bin"
 
@@ -609,10 +656,38 @@ def case_large_file_async_copy_offload_on(ctx):
     announce("PASS CASE: large_file_async_copy_offload_on")
 
 
+def case_short_copy_offload_on(ctx):
+    """
+    XCOPY-04: Short_Copy=ON — per-chunk CB_OFFLOAD packaging.
+
+    Uses a multi-chunk file (suite file_size_mb / chunk_size_mb, e.g. 128/64)
+    so Short_Copy=ON can be distinguished from OFF:
+      ON  -> >=N CB_OFFLOAD, each == chunk len, sum == file_size
+      OFF -> one CB_OFFLOAD with bytes == file_size (validated by 01/02/03)
+    """
+    announce("================================================")
+    announce("CASE: short_copy_offload_on (XCOPY-04)")
+    announce("================================================")
+    # Need at least 2 chunks to observe per-chunk CB vs single final CB.
+    if ctx["file_size_bytes"] <= ctx["chunk_size_bytes"]:
+        raise ConfigError(
+            "short_copy_offload_on needs file_size_mb > chunk_size_mb "
+            f"(got {ctx['size_mb']} / {ctx['chunk_size_mb']})"
+        )
+    _enable_short_copy(ctx)
+    ctx["src"] = f"{ctx['nfs_mount_a']}/xcopy_short_src.bin"
+    ctx["dst"] = f"{ctx['nfs_mount_a']}/xcopy_short_dst.bin"
+
+    _run_copy_with_pcap(ctx, copy_within_export)
+    _run_validations(ctx, _default_validations())
+    announce("PASS CASE: short_copy_offload_on")
+
+
 CASES = {
     "intra_export_copy_offload_on": case_intra_export_copy_offload_on,
     "cross_export_copy_offload_on": case_cross_export_copy_offload_on,
     "large_file_async_copy_offload_on": case_large_file_async_copy_offload_on,
+    "short_copy_offload_on": case_short_copy_offload_on,
 }
 
 
