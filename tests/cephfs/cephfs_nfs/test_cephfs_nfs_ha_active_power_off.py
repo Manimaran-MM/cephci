@@ -8,10 +8,13 @@ import traceback
 
 from ceph.ceph import CommandFailed
 from ceph.parallel import parallel
+from tests.cephfs.cephfs_nfs.nfs_ha_power_ops import (
+    get_baremetal_creds,
+    power_down,
+    power_up,
+)
 from tests.cephfs.cephfs_utilsV1 import FsUtils as FsUtilsV1
-from utility.baremetal_power_ops import IPMIPowerControl
 from utility.log import Log
-from utility.utils import get_cephci_config
 
 log = Log(__name__)
 
@@ -36,7 +39,7 @@ def run(ceph_cluster, **kw):
     8. Cleanup
     """
     try:
-        tc = "CEPH-83575196"
+        tc = "CEPH-83575195"
         log.info(f"Running cephfs {tc} test case")
         config = kw["config"]
         build = config.get("build", config.get("rhbuild"))
@@ -54,18 +57,11 @@ def run(ceph_cluster, **kw):
         nfs_name = "cephfs-nfs"
         virtual_ip = "10.8.128.100"
         subnet = "21"
-        cephci_config = get_cephci_config()
-        baremetal_creds = cephci_config.get("baremetal", None)
-        if not baremetal_creds:
-            raise CommandFailed(
-                "This test requires baremetal credientials to perform power operations"
-            )
-        baremetal_username = baremetal_creds.get("username")
-        baremetal_password = baremetal_creds.get("password")
-        if not baremetal_username or not baremetal_password:
-            raise CommandFailed(
-                "The 'baremetal' section in the configuration should include both 'username' and 'password' fields."
-            )
+        baremetal_username, baremetal_password = get_baremetal_creds()
+        if baremetal_username:
+            log.info("Using baremetal IPMI for power operations")
+        else:
+            log.info("No baremetal credentials; using OpenStack VM power operations")
         log.info("checking Pre-requisites")
         if not clients:
             log.info(
@@ -148,16 +144,11 @@ def run(ceph_cluster, **kw):
         with parallel() as p:
             p.spawn(write_io, client1, mount_dir, config.get("io_runtime", 300))
             for i in backend_server:
-                active_nfs_ipmi = IPMIPowerControl(
-                    host=f"{i.hostname}.ipmi.ceph.redhat.com",
-                    username=baremetal_username,
-                    password=baremetal_password,
+                power_down(
+                    ceph_cluster, i, baremetal_username, baremetal_password
                 )
-                log.info(f"Powering Off {i.hostname}")
-                active_nfs_ipmi.power_down()
                 time.sleep(config.get("shutdown_time", 300))
-                log.info(f"Powering On {i.hostname}")
-                active_nfs_ipmi.power_up()
+                power_up(ceph_cluster, i, baremetal_username, baremetal_password)
                 fs_util_v1.wait_for_host_online(client1, i)
                 fs_util_v1.wait_for_service_to_be_in_running(client1, i)
         active_nfs_after = get_active_nfs(nfs_servers, virtual_ip)

@@ -314,6 +314,13 @@ tests:
       abort-on-fail: false
   -
     test:
+      name: ordered lab shutdown and cluster recovery
+      module: cephfs_system.cluster_down_up.py
+      polarion-id: CEPH-11265
+      desc: Ordered lab shutdown and cluster recovery, no active IO
+      abort-on-fail: false
+  -
+    test:
       abort-on-fail: false
       desc: "Check for Crash"
       module: cephfs_crash_util.py

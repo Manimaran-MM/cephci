@@ -8,10 +8,13 @@ import traceback
 
 from ceph.ceph import CommandFailed
 from ceph.parallel import parallel
+from tests.cephfs.cephfs_nfs.nfs_ha_power_ops import (
+    get_baremetal_creds,
+    power_down,
+    power_up,
+)
 from tests.cephfs.cephfs_utilsV1 import FsUtils as FsUtilsV1
-from utility.baremetal_power_ops import IPMIPowerControl
 from utility.log import Log
-from utility.utils import get_cephci_config
 
 log = Log(__name__)
 
@@ -59,18 +62,11 @@ def run(ceph_cluster, **kw):
         nfs_name = "cephfs-nfs"
         virtual_ip = "10.8.128.100"
         subnet = "21"
-        cephci_config = get_cephci_config()
-        baremetal_creds = cephci_config.get("baremetal", None)
-        if not baremetal_creds:
-            raise CommandFailed(
-                "This test requires baremetal credientials to perform power operations"
-            )
-        baremetal_username = baremetal_creds.get("username")
-        baremetal_password = baremetal_creds.get("password")
-        if not baremetal_username or not baremetal_password:
-            raise CommandFailed(
-                "The 'baremetal' section in the configuration should include both 'username' and 'password' fields."
-            )
+        baremetal_username, baremetal_password = get_baremetal_creds()
+        if baremetal_username:
+            log.info("Using baremetal IPMI for power operations")
+        else:
+            log.info("No baremetal credentials; using OpenStack VM power operations")
         log.info("checking Pre-requisites")
         if not clients:
             log.info(
@@ -161,13 +157,13 @@ def run(ceph_cluster, **kw):
             p.spawn(
                 fs_util_v1.write_io, client1, mount_dir, config.get("io_runtime", 900)
             )
-            active_nfs_ipmi = IPMIPowerControl(
-                host=f"{backend_server[0].node.hostname}.ipmi.ceph.redhat.com",
-                username=baremetal_username,
-                password=baremetal_password,
-            )
             log.info(f"Powering Off {backend_server[0].node.hostname}")
-            active_nfs_ipmi.power_down()
+            power_down(
+                ceph_cluster,
+                backend_server[0],
+                baremetal_username,
+                baremetal_password,
+            )
             time.sleep(config.get("shutdown_time", 300))
             fs_util_v1.wait_for_host_offline(client1, backend_server[0])
         interm_list = copy.deepcopy(nfs_servers)
@@ -247,13 +243,13 @@ spec:
             cmd=f'ceph orch apply nfs {nfs_name} --placement "2 {orch_formatted_string}"',
         )
 
-        active_nfs_ipmi = IPMIPowerControl(
-            host=f"{backend_server[1].node.hostname}.ipmi.ceph.redhat.com",
-            username=baremetal_username,
-            password=baremetal_password,
-        )
         log.info(f"Powering Off {backend_server[1].node.hostname}")
-        active_nfs_ipmi.power_down()
+        power_down(
+            ceph_cluster,
+            backend_server[1],
+            baremetal_username,
+            baremetal_password,
+        )
         time.sleep(config.get("shutdown_time", 300))
         fs_util_v1.wait_for_host_offline(client1, backend_server[1])
         index_to_remove = None
@@ -301,12 +297,12 @@ spec:
             f"\nPrevious active node: {active_nfs.node.hostname}"
             f"\nCurrent active node: {active_nfs_after.node.hostname}"
         )
-        active_nfs_ipmi = IPMIPowerControl(
-            host=f"{backend_server[0].node.hostname}.ipmi.ceph.redhat.com",
-            username=baremetal_username,
-            password=baremetal_password,
+        power_up(
+            ceph_cluster,
+            backend_server[0],
+            baremetal_username,
+            baremetal_password,
         )
-        active_nfs_ipmi.power_up()
         fs_util_v1.wait_for_host_online(client1, backend_server[0])
         ps_ls = client1.exec_command(
             sudo=True, cmd=f"ceph orch ps {backend_server[0].node.hostname} -f json"
@@ -353,17 +349,17 @@ spec:
             check_ec=False,
         )
         log.info("Powering on the server")
-        active_nfs_ipmi = IPMIPowerControl(
-            host=f"{backend_server[1].node.hostname}.ipmi.ceph.redhat.com",
-            username=baremetal_username,
-            password=baremetal_password,
+        power_up(
+            ceph_cluster,
+            backend_server[1],
+            baremetal_username,
+            baremetal_password,
         )
-        active_nfs_ipmi.power_up()
-        active_nfs_ipmi = IPMIPowerControl(
-            host=f"{backend_server[0].node.hostname}.ipmi.ceph.redhat.com",
-            username=baremetal_username,
-            password=baremetal_password,
+        power_up(
+            ceph_cluster,
+            backend_server[0],
+            baremetal_username,
+            baremetal_password,
         )
-        active_nfs_ipmi.power_up()
         fs_util_v1.wait_for_host_online(client1, backend_server[1])
         fs_util_v1.wait_for_host_online(client1, backend_server[0])
