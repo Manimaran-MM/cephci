@@ -33,7 +33,7 @@ def run(ceph_cluster, **kw):
     8. Cleanup
     """
     try:
-        tc = "CEPH-83575091"
+        tc = "CEPH-83575196"
         log.info(f"Running cephfs {tc} test case")
         config = kw["config"]
         build = config.get("build", config.get("rhbuild"))
