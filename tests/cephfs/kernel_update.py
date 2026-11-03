@@ -4,6 +4,7 @@ import traceback
 
 from tests.cephfs.lib.cephfs_common_lib import CephFSCommonUtils
 from utility.log import Log
+from utility.utils import parse_custom_config_list
 
 log = Log(__name__)
 
@@ -116,6 +117,26 @@ def _reboot_node_and_wait_for_healthy(ceph_cluster, client, node):
     return _wait_for_cluster_healthy(ceph_cluster, client, node.hostname)
 
 
+def _resolve_kernel_repo_config(test_data):
+    """
+    Resolve kernel repo URL from --custom-config pre=<url> or post=<url>.
+
+    Prefers parsing the custom-config list (split on first '=') so other
+    entries such as ocpvirt_namespace do not shadow pre/post, and URLs that
+    contain '=' are preserved. Falls back to custom_config_dict.
+    """
+    test_data = test_data or {}
+    custom_dict = parse_custom_config_list(test_data.get("custom-config"))
+    if not custom_dict:
+        custom_dict = test_data.get("custom_config_dict") or {}
+
+    for key in ("pre", "post"):
+        if key in custom_dict and custom_dict[key]:
+            url = str(custom_dict[key]).rstrip("/").replace(" ", "")
+            return key, url
+    return None, None
+
+
 def run(ceph_cluster, **kw):
     """
     Check current kernel version
@@ -140,23 +161,24 @@ def run(ceph_cluster, **kw):
         clients = ceph_cluster.get_ceph_objects("client")
         test_data = kw.get("test_data")
         log.info("Test data is " + str(test_data))
-        custom_config = test_data.get("custom-config")[0].split("=")
-        pre_or_post = custom_config[0]
-        url = custom_config[1]
-        url = url.rstrip("/")
-        # removing space from the url
-        url = url.replace(" ", "")
+        pre_or_post, url = _resolve_kernel_repo_config(test_data)
+        if not pre_or_post or not url:
+            log.error(
+                "Missing kernel repo config. Pass --custom-config pre=<url> "
+                "or --custom-config post=<url>"
+            )
+            return 1
         log.info("Given Kernel Information is " + str(url))
         verification_type = []
-        if "pre" in pre_or_post:
+        if pre_or_post == "pre":
             log.info("This is a pre-verification")
             verification_type.append("pre")
-        elif "post" in pre_or_post:
+        elif pre_or_post == "post":
             log.info("This is a Post verification")
             verification_type.append("post")
         else:
-            log.error("Invalid repo file")
-            log.error("The repo file should contain [pre] or [post]")
+            log.error("Invalid kernel repo config key: %s", pre_or_post)
+            log.error("Expected --custom-config pre=<url> or post=<url>")
             return 1
         log.info("checking Pre-requisites")
         if not clients:
@@ -262,8 +284,7 @@ def run(ceph_cluster, **kw):
                     log.error("Kernel update failed")
                     return 1
         else:
-            log.error("Invalid repo file")
-            log.error("The repo file should start with either [pre] or [post]")
+            log.error("Invalid kernel verification type: %s", verification_type)
             return 1
         log.info("kernel update success")
         return 0
