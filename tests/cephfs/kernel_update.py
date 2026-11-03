@@ -225,6 +225,26 @@ def _update_nodes(nodes, client, cephfs_common_utils, kernel_package, install_fn
     return 0
 
 
+def _resolve_kernel_repo_config(test_data):
+    """
+    Resolve kernel repo URL from --custom-config pre=<url> or post=<url>.
+
+    Prefers parsing the custom-config list (split on first '=') so other
+    entries such as ocpvirt_namespace do not shadow pre/post, and URLs that
+    contain '=' are preserved. Falls back to custom_config_dict.
+    """
+    test_data = test_data or {}
+    custom_dict = parse_custom_config_list(test_data.get("custom-config"))
+    if not custom_dict:
+        custom_dict = test_data.get("custom_config_dict") or {}
+
+    for key in ("pre", "post"):
+        if key in custom_dict and custom_dict[key]:
+            url = str(custom_dict[key]).rstrip("/").replace(" ", "")
+            return key, url
+    return None, None
+
+
 def run(ceph_cluster, **kw):
     """
     Update cluster/client kernels for pre- or post-verification.
