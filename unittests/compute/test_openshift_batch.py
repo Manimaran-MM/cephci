@@ -66,6 +66,7 @@ def test_process_ocpvirt_custom_config_defaults():
         "ocpvirt_profile": DEFAULT_OCPVIRT_PROFILE,
         "ocpvirt_cpu": None,
         "ocpvirt_memory": None,
+        "ocpvirt_secure_boot": True,
     }
     assert DEFAULT_OCPVIRT_PROFILE == "o1.large"
 
@@ -86,6 +87,7 @@ def test_process_ocpvirt_custom_config_overrides():
         "ocpvirt_profile": "cx1.2xlarge",
         "ocpvirt_cpu": None,
         "ocpvirt_memory": None,
+        "ocpvirt_secure_boot": True,
     }
 
 
@@ -99,7 +101,25 @@ def test_process_ocpvirt_custom_config_custom_resources():
         "ocpvirt_profile": None,
         "ocpvirt_cpu": 4,
         "ocpvirt_memory": "16Gi",
+        "ocpvirt_secure_boot": True,
     }
+
+
+def test_process_ocpvirt_custom_config_secure_boot_false():
+    cfg = process_ocpvirt_custom_config(
+        ["ocpvirt_secure_boot=false", "ocpvirt_profile=o1.large"]
+    )
+    assert cfg["ocpvirt_secure_boot"] is False
+
+
+def test_process_ocpvirt_custom_config_secure_boot_hyphen_alias():
+    cfg = process_ocpvirt_custom_config(["ocpvirt-secure-boot=0"])
+    assert cfg["ocpvirt_secure_boot"] is False
+
+
+def test_process_ocpvirt_custom_config_secure_boot_invalid():
+    with pytest.raises(NodeError, match="Invalid ocpvirt_secure_boot"):
+        process_ocpvirt_custom_config(["ocpvirt_secure_boot=maybe"])
 
 
 def test_process_ocpvirt_custom_config_hyphen_aliases():
@@ -133,6 +153,7 @@ def test_apply_ocpvirt_vm_profile_uses_cluster_instancetype(mock_clients):
     )
     assert params["instancetype"] == "cx1.2xlarge"
     assert params["image-name"] == "datasource://rhel9"
+    assert params["secure_boot"] is True
     assert "cpu" not in params
     assert "memory" not in params
 
@@ -146,6 +167,19 @@ def test_apply_ocpvirt_vm_profile_defaults_to_o1_large(mock_clients):
         None,
     )
     assert params["instancetype"] == "o1.large"
+    assert params["secure_boot"] is True
+
+
+@patch("compute.openshift.get_k8s_clients")
+def test_apply_ocpvirt_vm_profile_secure_boot_false(mock_clients):
+    mock_clients.return_value = (_mock_custom_api(), MagicMock())
+    params = apply_ocpvirt_vm_profile(
+        {"image-name": "datasource://rhel9"},
+        OCP_CRED,
+        ["ocpvirt_secure_boot=false"],
+    )
+    assert params["instancetype"] == "o1.large"
+    assert params["secure_boot"] is False
 
 
 def _mock_core_api_limitrange(cpu_max="20", memory_max="64Gi"):
@@ -238,6 +272,7 @@ def test_build_virtualmachine_cr_with_instancetype():
     assert "cpu" not in domain
     assert "memory" not in domain
     assert "resources" not in domain
+    assert domain["firmware"]["bootloader"]["efi"]["secureBoot"] is True
 
 
 def test_build_virtualmachine_cr_with_custom_resources():
