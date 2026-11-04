@@ -295,7 +295,10 @@ class BootstrapMixin:
             self.cluster.use_cdn = True
             self.set_cdn_tool_repo(_ceph_version, manifest_obj)
         elif build_type == "released" and base_url == manifest_obj.repository:
-            custom_image = False
+            # Use CDN for the tools/cephadm RPM, but keep custom_image enabled so
+            # bootstrap gets --image <released tag> from the build manifest.
+            # Clearing custom_image here made cephadm fall back to its packaged
+            # default (:latest), which is not the released container image.
             self.cluster.use_cdn = True
             self.set_cdn_tool_repo(manifest_obj)
         elif custom_repo:
