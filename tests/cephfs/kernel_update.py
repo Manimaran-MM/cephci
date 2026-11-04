@@ -2,8 +2,10 @@ import datetime
 import time
 import traceback
 
+from ceph.ceph import CommandFailed
 from tests.cephfs.lib.cephfs_common_lib import CephFSCommonUtils
 from utility.log import Log
+from utility.retry import retry
 from utility.utils import parse_custom_config_list
 
 log = Log(__name__)
@@ -212,7 +214,9 @@ def run(ceph_cluster, **kw):
                 log.info(f" kernel package {kernel_package}+")
                 if kernel_version not in kernel_package:
                     log.info(f"Updating kernel using private repo {kernel_package}")
-                    cnode.exec_command(sudo=True, cmd=_PRE_KERNEL_YUM_CMD)
+                    retry(CommandFailed, tries=3, delay=60)(cnode.exec_command)(
+                        sudo=True, cmd=_PRE_KERNEL_YUM_CMD
+                    )
                     if _reboot_node_and_wait_for_healthy(
                         ceph_cluster, client1, cnode
                     ):
