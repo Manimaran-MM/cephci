@@ -73,6 +73,12 @@ def construct_registry(
             "--custom-config bootstrap-registry=<host> or use an image with a host."
         )
     reg_args = resolve_registry_login(registry)
+    if not reg_args:
+        logger.info(
+            "Registry host %r is anonymous/public; skipping bootstrap login args",
+            registry,
+        )
+        return ""
     logger.debug("Registry login args for host %r", registry)
     if json_file:
         reg = dict((k.lstrip("registry-"), v) for k, v in reg_args.items())
@@ -295,10 +301,7 @@ class BootstrapMixin:
             self.cluster.use_cdn = True
             self.set_cdn_tool_repo(_ceph_version, manifest_obj)
         elif build_type == "released" and base_url == manifest_obj.repository:
-            # Use CDN for the tools/cephadm RPM, but keep custom_image enabled so
-            # bootstrap gets --image <released tag> from the build manifest.
-            # Clearing custom_image here made cephadm fall back to its packaged
-            # default (:latest), which is not the released container image.
+            custom_image = False
             self.cluster.use_cdn = True
             self.set_cdn_tool_repo(manifest_obj)
         elif custom_repo:
