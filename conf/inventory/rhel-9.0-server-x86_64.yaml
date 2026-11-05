@@ -3,7 +3,7 @@ version_id: 9.0
 id: rhel
 instance:
   create:
-    image-name: RHEL-9.0.0-x86_64-nightly-updates-latest
+    image-name: RHEL-9.0.0-x86_64-ga-latest
     vm-size: ci.standard.medium
 
   setup: |

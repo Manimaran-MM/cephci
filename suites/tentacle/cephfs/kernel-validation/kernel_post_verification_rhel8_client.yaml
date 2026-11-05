@@ -114,7 +114,7 @@ tests:
           - node5:
               release: 7.1
               platform: rhel-8
-              tag: released
+              tag: stable
         install_packages:
           - ceph-common
       desc: "Configure RHCS 7.1 client on RHEL 8 (client system 1)"
@@ -132,7 +132,7 @@ tests:
           - node6:
               release: 7.1
               platform: rhel-8
-              tag: released
+              tag: stable
         install_packages:
           - ceph-common
       desc: "Configure RHCS 7.1 client on RHEL 8 (client system 2)"

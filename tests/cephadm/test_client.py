@@ -144,10 +144,7 @@ def add(cls, config: Dict) -> None:
                         cmd=f"{enable_cmd}{manifest.repo_id}",
                     )
 
-            # if rhcs_version != "default" and not _manifest_section:
-            if rhcs_version != "default" and (
-                not _manifest_section or (manifest_obj and manifest_obj.product == "redhat")
-            ):
+            if rhcs_version != "default" and not _manifest_section:
                 try:
                     # Disabling all the repos and enabling the ones we need to install the ceph client
                     for cmd in disable_all:
@@ -195,7 +192,7 @@ def add(cls, config: Dict) -> None:
                     _node, "/etc/ceph/ceph.client.admin.keyring", admin_keyring, "w"
                 )
 
-            # Install ceph-common (beta RHEL compose repos are enabled in install_prereq)
+            # Install ceph-common
             if config.get("install_packages"):
                 _manifest = manifest_obj or cls.config.get("manifest")
                 if _manifest and _manifest.product == "ibm":

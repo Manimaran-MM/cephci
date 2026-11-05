@@ -121,7 +121,6 @@ It also sets `domain.resources` requests/limits to guest CPU +1 and guest memory
 |-----|---------|-------------|
 | `ocpvirt_cpu` | `ocpvirt-cpu` | vCPU cores (positive integer) |
 | `ocpvirt_memory` | `ocpvirt-memory` | Kubernetes quantity (`16Gi`) or integer GiB (`16` → `16Gi`) |
-| `ocpvirt_secure_boot` | `ocpvirt-secure-boot` | EFI Secure Boot (`true`/`false`, default `true`) |
 
 Rules:
 
@@ -140,14 +139,6 @@ custom-config:
   - ocpvirt_namespace=rdu3_ceph_jenkins
   - ocpvirt_cpu=6
   - ocpvirt_memory=24Gi
-```
-
-Kernel-update / unsigned kernel jobs:
-
-```yaml
-custom-config:
-  - ocpvirt_namespace=rdu3_ceph_jenkins
-  - ocpvirt_secure_boot=false
 ```
 
 Equivalent CLI:

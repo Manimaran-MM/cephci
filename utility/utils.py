@@ -1139,22 +1139,6 @@ def parse_custom_config_list(custom_config):
     return dict(item.split("=", 1) for item in custom_config if "=" in item)
 
 
-def is_kernel_update_custom_config(test_data):
-    """
-    Return True when cephci was run with kernel pipeline custom config.
-
-    Matches ``--custom-config pre=<url>`` or ``--custom-config post=<url>`` as
-    used by tests/cephfs/kernel_update.py.
-    """
-    if not test_data:
-        return False
-    custom_config = test_data.get("custom-config")
-    if not custom_config:
-        return False
-    overrides = parse_custom_config_list(custom_config)
-    return "pre" in overrides or "post" in overrides
-
-
 def resolve_use_ipv6(custom_config, cloud_type=None, osp_cred=None):
     """
     Resolve whether to use IPv6 from custom_config and optionally from infra credentials.
@@ -3072,6 +3056,14 @@ def log_json_dump(data):
     return json.dumps(data, indent=4)
 
 
+def _is_truthy(value):
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return False
+    return str(value).strip().lower() in ("1", "true", "yes", "y", "on")
+
+
 def get_registry_info(registry):
     """Get registry entry from the host-keyed ``registries`` section.
 
@@ -3080,7 +3072,8 @@ def get_registry_info(registry):
 
     Returns:
         dict with at least username/password (``user`` is accepted as an alias
-        for ``username``). Optional keys: ``product``, ``production``.
+        for ``username``), or ``anonymous: true`` for public registries that
+        need no login. Optional keys: ``product``, ``production``.
 
     Raises:
         KeyError: when ``registries`` is missing or ``registry`` is not listed.
@@ -3097,6 +3090,10 @@ def get_registry_info(registry):
         )
     if not isinstance(info, dict):
         raise KeyError(f"Invalid registries entry for {registry!r}")
+    normalized = dict(info)
+    if _is_truthy(info.get("anonymous")):
+        normalized["anonymous"] = True
+        return normalized
     # Normalize user/username from template variants
     username = info.get("username") or info.get("user")
     password = info.get("password")
@@ -3104,7 +3101,6 @@ def get_registry_info(registry):
         raise KeyError(
             f"registries[{registry!r}] must include username/user and password"
         )
-    normalized = dict(info)
     normalized["username"] = username
     normalized["password"] = password
     return normalized
@@ -3140,8 +3136,12 @@ def resolve_registry_login(registry_host):
 
     Returns:
         dict: registry-url, registry-username, registry-password
+        Empty dict when the registry is marked ``anonymous: true`` (public pull,
+        no login flags for cephadm/podman).
     """
     info = get_registry_info(registry_host)
+    if info.get("anonymous"):
+        return {}
     return {
         "registry-url": registry_host,
         "registry-username": info["username"],
