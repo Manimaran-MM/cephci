@@ -89,6 +89,15 @@ def test_get_registry_info_missing_raises(monkeypatch):
         get_registry_info("missing.example")
 
 
+def test_anonymous_registry_skips_login_args(monkeypatch):
+    config = {"registries": {"quay.io": {"anonymous": True}}}
+    monkeypatch.setattr("utility.utils.get_cephci_config", lambda: config)
+
+    info = get_registry_info("quay.io")
+    assert info.get("anonymous") is True
+    assert resolve_registry_login("quay.io") == {}
+
+
 def test_get_registry_details_uses_image_host(monkeypatch):
     config = {
         "registries": {

@@ -86,6 +86,9 @@ registries:
     product: rh
     username: <fake-username>
     password: <fake-password>
+  # Public registry pulls (no podman/cephadm login)
+  quay.io:
+    anonymous: true
 
 repos:
   local:

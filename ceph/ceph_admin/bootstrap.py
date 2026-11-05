@@ -72,6 +72,12 @@ def construct_registry(
             "--custom-config bootstrap-registry=<host> or use an image with a host."
         )
     reg_args = resolve_registry_login(registry)
+    if not reg_args:
+        logger.info(
+            "Registry host %r is anonymous/public; skipping bootstrap login args",
+            registry,
+        )
+        return ""
     logger.debug("Registry login args for host %r", registry)
     if json_file:
         reg = dict((k.lstrip("registry-"), v) for k, v in reg_args.items())

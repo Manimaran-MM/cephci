@@ -685,8 +685,14 @@ def registry_login(ceph, distro_ver, test_data=None, cloud_type="openstack"):
             reg_args = resolve_registry_login(host)
         except KeyError as err:
             raise ConfigError(str(err)) from err
-        user = reg_args["registry-username"]
-        passwd = reg_args["registry-password"]
+        user = reg_args.get("registry-username")
+        passwd = reg_args.get("registry-password")
+        if not user or not passwd:
+            log.info(
+                "Skipping registry login for %s (anonymous/public; no credentials)",
+                host,
+            )
+            continue
         b64_auth = base64.b64encode(f"{user}:{passwd}".encode("ascii"))
         auths[host] = {"auth": b64_auth.decode("utf-8")}
         log.info("Prepared auth for registry host %s", host)
