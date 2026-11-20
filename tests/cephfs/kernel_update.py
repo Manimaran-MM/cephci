@@ -24,13 +24,32 @@ _PRE_KERNEL_YUM_CMD = (
 )
 
 _REPO_FILE = "/etc/yum.repos.d/rh_add_repo.repo"
+_SHIM_COMPOSE_REPO_FILE = "/etc/yum.repos.d/rh_shim_compose.repo"
+_SHIM_COMPOSE_REPO_ID = "rh_shim_compose"
 
-# Newer CKI kernel-core Conflicts with old shim; upgrade shim from BaseOS only
-# before the CKI-only kernel transaction so BaseOS cannot pull a different kernel.
+# Newer CKI kernel-core Conflicts with old shim (< 15.8-1). Upgrade shim from
+# BaseOS only before the CKI-only kernel transaction so BaseOS cannot pull a
+# different kernel. CDN BaseOS on old guests (e.g. RHEL 9.0) often has no
+# newer shim — fall back to a rel-eng compose BaseOS tree that does.
+_SHIM_MIN_EVR = "15.8-1"
 _SHIM_BASEOS_REPO = {
     "8": "rhel-8-for-x86_64-baseos-rpms",
     "9": "rhel-9-for-x86_64-baseos-rpms",
     "10": "rhel-10-for-x86_64-baseos-rpms",
+}
+_SHIM_COMPOSE_BASEOS = {
+    "8": (
+        "https://download.devel.redhat.com/rhel-8/rel-eng/RHEL-8/"
+        "latest-RHEL-8/compose/BaseOS/x86_64/os/"
+    ),
+    "9": (
+        "https://download.devel.redhat.com/rhel-9/rel-eng/RHEL-9/"
+        "latest-RHEL-9.4/compose/BaseOS/x86_64/os/"
+    ),
+    "10": (
+        "https://download.devel.redhat.com/rhel-10/rel-eng/RHEL-10/"
+        "latest-RHEL-10/compose/BaseOS/x86_64/os/"
+    ),
 }
 
 
@@ -183,13 +202,123 @@ def _write_pre_repo(node, url):
     )
 
 
-def _upgrade_shim_from_baseos(node):
-    """Upgrade installed shim packages from BaseOS only.
+def _shim_nevras(node):
+    """Return installed shim* NEVRAs for logging."""
+    out, _ = node.exec_command(
+        sudo=True,
+        cmd=(
+            "rpm -qa 'shim*' --qf "
+            "'%{NAME}-%|EPOCH?{%{EPOCH}:}:|%{VERSION}-%{RELEASE}.%{ARCH}\\n'"
+        ),
+        check_ec=False,
+    )
+    return [line.strip() for line in (out or "").splitlines() if line.strip()]
 
-    CKI kernel-core may Conflict with shim < 15.8-1. The subsequent kernel
-    update uses --disablerepo='*' --enablerepo=rh_add_repo so BaseOS cannot
-    satisfy that dep in the same transaction. Upgrade shim first from BaseOS
-    without enabling AppStream/other repos that could change the kernel NVR.
+
+def _shim_names(node):
+    """Return installed shim* package names."""
+    out, _ = node.exec_command(
+        sudo=True,
+        cmd="rpm -qa 'shim*' --qf '%{NAME}\\n'",
+        check_ec=False,
+    )
+    return sorted({p.strip() for p in (out or "").splitlines() if p.strip()})
+
+
+def _split_evr(evr):
+    """Split EVR string into (epoch, version, release) for rpm.labelCompare."""
+    if ":" in evr:
+        epoch, vr = evr.split(":", 1)
+    else:
+        epoch, vr = "0", evr
+    if "-" in vr:
+        version, release = vr.rsplit("-", 1)
+    else:
+        version, release = vr, ""
+    return (str(epoch or "0"), version, release)
+
+
+def _shim_meets_minimum(node, min_evr=_SHIM_MIN_EVR):
+    """True when every installed shim* EVR is >= min_evr (rpm labelCompare)."""
+    out, _ = node.exec_command(
+        sudo=True,
+        cmd=(
+            "rpm -qa 'shim*' --qf "
+            "'%|EPOCH?{%{EPOCH}}:{0}|:%{VERSION}-%{RELEASE}\\n'"
+        ),
+        check_ec=False,
+    )
+    lines = [line.strip() for line in (out or "").splitlines() if line.strip()]
+    if not lines:
+        return True
+
+    try:
+        import rpm  # available on cephci runners / RHEL
+    except ImportError:
+        # Fallback: compare (version, release) tuples as strings.
+        log.warning("python-rpm unavailable; using string compare for shim EVR")
+        return all(
+            _split_evr(evr)[1:] >= _split_evr(min_evr)[1:] for evr in lines
+        )
+
+    min_t = _split_evr(min_evr)
+    return all(rpm.labelCompare(_split_evr(evr), min_t) >= 0 for evr in lines)
+
+
+def _yum_update_shim(node, pkgs, repo_id):
+    """yum update listed shim packages from a single enabled repo."""
+    pkg_list = " ".join(pkgs)
+    node.exec_command(
+        sudo=True,
+        cmd=(
+            f"yum update -y --nogpgcheck {pkg_list} "
+            f"--disablerepo='*' --enablerepo={repo_id}"
+        ),
+    )
+
+
+def _upgrade_shim_from_compose(node, pkgs, major):
+    """Upgrade shim* from a rel-eng BaseOS compose (CDN often too old on 9.0)."""
+    baseurl = _SHIM_COMPOSE_BASEOS.get(major)
+    if not baseurl:
+        log.warning(
+            "No compose BaseOS URL for OS major %s on %s; cannot refresh shim",
+            major,
+            node.hostname,
+        )
+        return False
+
+    log.info(
+        "CDN BaseOS left shim < %s on %s; upgrading from compose BaseOS %s",
+        _SHIM_MIN_EVR,
+        node.hostname,
+        baseurl,
+    )
+    node.exec_command(
+        sudo=True,
+        cmd=(
+            f"printf '%s\\n' '[{_SHIM_COMPOSE_REPO_ID}]' 'name=Shim Compose BaseOS' "
+            f"'baseurl={baseurl}' 'enabled=1' 'gpgcheck=0' "
+            f"> {_SHIM_COMPOSE_REPO_FILE}"
+        ),
+    )
+    try:
+        _yum_update_shim(node, pkgs, _SHIM_COMPOSE_REPO_ID)
+    finally:
+        node.exec_command(
+            sudo=True,
+            cmd=f"rm -f {_SHIM_COMPOSE_REPO_FILE}",
+            check_ec=False,
+        )
+    return True
+
+
+def _upgrade_shim_from_baseos(node):
+    """Upgrade installed shim packages enough for CKI kernel-core Conflicts.
+
+    Order:
+      1. CDN BaseOS only (no AppStream — avoids pulling a different kernel)
+      2. If still < 15.8-1 (typical on RHEL 9.0 guests), rel-eng compose BaseOS
     """
     major = _node_os_major(node)
     baseos_repo = _SHIM_BASEOS_REPO.get(major)
@@ -201,29 +330,54 @@ def _upgrade_shim_from_baseos(node):
         )
         return
 
-    out, _ = node.exec_command(
-        sudo=True,
-        cmd="rpm -qa 'shim*' --qf '%{NAME}\\n'",
-        check_ec=False,
-    )
-    pkgs = sorted({p.strip() for p in (out or "").splitlines() if p.strip()})
+    pkgs = _shim_names(node)
     if not pkgs:
         log.info("No shim packages installed on %s; skipping shim upgrade", node.hostname)
         return
 
-    pkg_list = " ".join(pkgs)
+    before = _shim_nevras(node)
     log.info(
-        "Upgrading shim from BaseOS on %s before CKI kernel update: %s (repo=%s)",
+        "Upgrading shim from BaseOS on %s before CKI kernel update: %s "
+        "(installed=%s repo=%s)",
         node.hostname,
-        pkg_list,
+        " ".join(pkgs),
+        ", ".join(before) or "unknown",
         baseos_repo,
     )
-    node.exec_command(
-        sudo=True,
-        cmd=(
-            f"yum update -y --nogpgcheck {pkg_list} "
-            f"--disablerepo='*' --enablerepo={baseos_repo}"
-        ),
+    _yum_update_shim(node, pkgs, baseos_repo)
+
+    if _shim_meets_minimum(node):
+        log.info(
+            "Shim on %s meets minimum %s after CDN BaseOS: %s",
+            node.hostname,
+            _SHIM_MIN_EVR,
+            ", ".join(_shim_nevras(node)),
+        )
+        return
+
+    log.warning(
+        "Shim still below %s on %s after CDN BaseOS (%s); trying compose fallback",
+        _SHIM_MIN_EVR,
+        node.hostname,
+        ", ".join(_shim_nevras(node)),
+    )
+    if not _upgrade_shim_from_compose(node, pkgs, major):
+        return
+
+    after = _shim_nevras(node)
+    if _shim_meets_minimum(node):
+        log.info(
+            "Shim on %s meets minimum %s after compose BaseOS: %s",
+            node.hostname,
+            _SHIM_MIN_EVR,
+            ", ".join(after),
+        )
+        return
+
+    raise CommandFailed(
+        f"shim on {node.hostname} still below {_SHIM_MIN_EVR} after CDN+compose "
+        f"BaseOS upgrade (installed: {', '.join(after) or 'none'}); "
+        f"CKI kernel-core will Conflict"
     )
 
 
