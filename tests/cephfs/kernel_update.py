@@ -25,6 +25,14 @@ _PRE_KERNEL_YUM_CMD = (
 
 _REPO_FILE = "/etc/yum.repos.d/rh_add_repo.repo"
 
+# Newer CKI kernel-core Conflicts with old shim; upgrade shim from BaseOS only
+# before the CKI-only kernel transaction so BaseOS cannot pull a different kernel.
+_SHIM_BASEOS_REPO = {
+    "8": "rhel-8-for-x86_64-baseos-rpms",
+    "9": "rhel-9-for-x86_64-baseos-rpms",
+    "10": "rhel-10-for-x86_64-baseos-rpms",
+}
+
 
 def _print_system_info(client, label):
     """Run OS/kernel/ceph version commands on client.1 and log output."""
@@ -175,6 +183,50 @@ def _write_pre_repo(node, url):
     )
 
 
+def _upgrade_shim_from_baseos(node):
+    """Upgrade installed shim packages from BaseOS only.
+
+    CKI kernel-core may Conflict with shim < 15.8-1. The subsequent kernel
+    update uses --disablerepo='*' --enablerepo=rh_add_repo so BaseOS cannot
+    satisfy that dep in the same transaction. Upgrade shim first from BaseOS
+    without enabling AppStream/other repos that could change the kernel NVR.
+    """
+    major = _node_os_major(node)
+    baseos_repo = _SHIM_BASEOS_REPO.get(major)
+    if not baseos_repo:
+        log.warning(
+            "No BaseOS repo mapping for OS major %s on %s; skipping shim upgrade",
+            major,
+            node.hostname,
+        )
+        return
+
+    out, _ = node.exec_command(
+        sudo=True,
+        cmd="rpm -qa 'shim*' --qf '%{NAME}\\n'",
+        check_ec=False,
+    )
+    pkgs = sorted({p.strip() for p in (out or "").splitlines() if p.strip()})
+    if not pkgs:
+        log.info("No shim packages installed on %s; skipping shim upgrade", node.hostname)
+        return
+
+    pkg_list = " ".join(pkgs)
+    log.info(
+        "Upgrading shim from BaseOS on %s before CKI kernel update: %s (repo=%s)",
+        node.hostname,
+        pkg_list,
+        baseos_repo,
+    )
+    node.exec_command(
+        sudo=True,
+        cmd=(
+            f"yum update -y --nogpgcheck {pkg_list} "
+            f"--disablerepo='*' --enablerepo={baseos_repo}"
+        ),
+    )
+
+
 def _build_post_rpm_install_cmd(url):
     """
     Build `rpm -ivh` command with RHEL-8/RHEL-9 package install order.
@@ -276,6 +328,7 @@ def run(ceph_cluster, **kw):
 
             def _install_pre(node):
                 _write_pre_repo(node, url)
+                _upgrade_shim_from_baseos(node)
                 log.info("Updating kernel using private repo %s", kernel_package)
                 retry(CommandFailed, tries=3, delay=60)(node.exec_command)(
                     sudo=True, cmd=_PRE_KERNEL_YUM_CMD
@@ -288,6 +341,8 @@ def run(ceph_cluster, **kw):
             kernel_update_cmd, kernel_package = _build_post_rpm_install_cmd(url)
 
             def _install_post(node):
+                # rpm -ivh also fails on shim Conflicts from old guest images.
+                _upgrade_shim_from_baseos(node)
                 log.info("Updating kernel using below packages")
                 log.info(kernel_update_cmd)
                 node.exec_command(sudo=True, cmd=kernel_update_cmd)
