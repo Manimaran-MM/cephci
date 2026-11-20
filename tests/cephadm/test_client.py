@@ -129,7 +129,26 @@ def add(cls, config: Dict) -> None:
                     enabled_repos.append(repo)
             log.debug(f"Enabled repos on the system are : {enabled_repos}")
 
+            def _platform_ceph_repo_url(manifest):
+                """Return compose/repo URL for manifest.platform if present."""
+                repositories = (manifest.build_info or {}).get("repositories") or {}
+                for key in (getattr(manifest, "datacenter", None), "default"):
+                    if not key:
+                        continue
+                    platform_repos = repositories.get(key) or {}
+                    repo_url = platform_repos.get(manifest.platform)
+                    if repo_url:
+                        return repo_url
+                return None
+
             def enable_cdn_ceph_repo(manifest):
+                """Enable Ceph package source for the client platform.
+
+                Prefer the platform compose/repo URL from the QE manifest so
+                mixed-OS clients (e.g. RHEL-8 client on a RHEL-9 cluster) get
+                elNcp packages that match the version pin. Fall back to CDN
+                repo_id when no compose URL is available.
+                """
                 if manifest.product == "ibm":
                     repo_url = manifest.build_info["repositories"]["default"][
                         manifest.platform
@@ -138,7 +157,21 @@ def add(cls, config: Dict) -> None:
                         sudo=True,
                         cmd=f"dnf config-manager --add-repo {repo_url}",
                     )
-                elif manifest.repo_id:
+                    return
+
+                repo_url = _platform_ceph_repo_url(manifest)
+                if repo_url:
+                    log.info(
+                        f"Adding Ceph compose repo for {manifest.platform} on "
+                        f"{_node.hostname}: {repo_url}"
+                    )
+                    _node.exec_command(
+                        sudo=True,
+                        cmd=f"dnf config-manager --add-repo {repo_url}",
+                    )
+                    return
+
+                if manifest.repo_id:
                     _node.exec_command(
                         sudo=True,
                         cmd=f"{enable_cmd}{manifest.repo_id}",
@@ -170,6 +203,11 @@ def add(cls, config: Dict) -> None:
                 wa_cmds = ["subscription-manager release --unset", "yum clean all"]
                 for wa_cmd in wa_cmds:
                     _node.exec_command(sudo=True, cmd=wa_cmd)
+            elif manifest_obj and _manifest_section:
+                # Version-pinned client install (tag: stable/released/...): do not
+                # wipe existing RHEL repos, but still attach the Ceph package
+                # source for this client platform before yum install.
+                enable_cdn_ceph_repo(manifest_obj)
 
             # Copy the keyring to client
             _node.exec_command(sudo=True, cmd="mkdir -p /etc/ceph")
