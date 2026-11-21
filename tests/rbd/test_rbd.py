@@ -15,6 +15,7 @@ import json
 import re
 from time import sleep
 
+from ceph.ceph import CommandFailed
 from ceph.rbd.utils import get_ceph_version_from_rhbuild
 from ceph.utils import get_nodes_by_ids
 from utility.log import Log
@@ -23,6 +24,15 @@ log = Log(__name__)
 
 TEST_REPO = "https://github.com/ceph/ceph.git"
 SCRIPT_PATH = "qa/workunits/rbd"
+
+# xmlstarlet moved into RHEL AppStream at 9.1 and was retired from EPEL 9.
+# RHEL 9.0 content (release --set 9.0) has neither; install the el9 AppStream
+# RPM by URL without changing subscription-manager release.
+_XMLSTARLET_EL9_RPM = (
+    "https://download.devel.redhat.com/rhel-9/rel-eng/RHEL-9/"
+    "latest-RHEL-9.1/compose/AppStream/x86_64/os/Packages/"
+    "xmlstarlet-1.6.1-20.el9.x86_64.rpm"
+)
 
 
 def _node_os_major(node) -> str:
@@ -82,23 +92,51 @@ def one_time_setup(node, rhbuild, branch: str) -> None:
     except BaseException:  # noqa
         pass
 
-    EPEL_RPM = (
-        f"https://dl.fedoraproject.org/pub/epel/epel-release-latest-{os_ver}.noarch.rpm"
-    )
+    # EPEL still needed on EL7/EL8 for xmlstarlet; not useful for xmlstarlet on EL9+.
+    if os_ver in ("7", "8"):
+        epel_rpm = (
+            f"https://dl.fedoraproject.org/pub/epel/"
+            f"epel-release-latest-{os_ver}.noarch.rpm"
+        )
+        node.exec_command(
+            sudo=True, cmd=f"yum install -y {epel_rpm} --nogpgcheck"
+        )
 
-    commands = [
-        {"cmd": f"yum install -y {EPEL_RPM} --nogpgcheck", "sudo": True},
-        {
-            "cmd": "yum install -y xmlstarlet rbd-nbd qemu-img cryptsetup --nogpgcheck",
-            "sudo": True,
-        },
-    ]
-    for command in commands:
-        node.exec_command(**command)
+    # Keep these on CDN BaseOS/AppStream/Ceph; do not bundle with xmlstarlet so a
+    # missing EPEL/AppStream package does not block the rest.
+    node.exec_command(
+        sudo=True,
+        cmd="yum install -y rbd-nbd qemu-img cryptsetup --nogpgcheck",
+    )
+    _install_xmlstarlet(node, os_ver)
 
     # Blind sleep to ensure the Mon service has restarted.
     # TODO: Identify a way to check the service is running
     sleep(5)
+
+
+def _install_xmlstarlet(node, os_ver: str) -> None:
+    """Install xmlstarlet without changing RHEL release lock.
+
+    On RHEL 9.0 (AppStream locked to 9.0), xmlstarlet is absent from CDN and
+    EPEL 9. Pull the el9 AppStream RPM by URL instead of bumping release to 9.1.
+    """
+    try:
+        node.exec_command(
+            sudo=True, cmd="yum install -y xmlstarlet --nogpgcheck"
+        )
+        return
+    except CommandFailed:
+        if os_ver != "9":
+            raise
+        log.info(
+            "xmlstarlet not in enabled repos (typical on RHEL 9.0 content); "
+            "installing AppStream el9 RPM by URL without changing release"
+        )
+
+    node.exec_command(
+        sudo=True, cmd=f"yum install -y {_XMLSTARLET_EL9_RPM} --nogpgcheck"
+    )
 
 
 def run(ceph_cluster, **kwargs) -> int:
