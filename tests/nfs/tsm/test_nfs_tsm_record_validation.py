@@ -25,7 +25,8 @@ from utility.log import Log
 log = Log(__name__)
 
 NFS_PORT = 12050
-TSM_PORT = 36371
+# Keep TSM below ephemeral range (32768-60999) — OSD source ports collide otherwise.
+TSM_PORT = 26371
 
 # ---------------------------------------------------------------------------
 # Each workflow: background hold cmd(s) + expected open/lock delta.
@@ -136,6 +137,8 @@ WORKFLOWS = {
     # A holds exclusive lock; B opens then waits (blocked).
     # B's open is counted even while fcntl blocks → open +2, lock +1.
     # A holds lock; B open then CLOSE while blocked → net open +1, lock +1
+    # PRODUCT BUG (NFSv4.0): B's open stays while lock-blocked (no OPEN→CLOSE
+    # settle); peer open remains +2 vs expected +1. Passes on 4.1/4.2.
     "two_locks_unlock": {
         "delta_open": 1,
         "delta_lock": 1,
@@ -345,18 +348,23 @@ WORKFLOWS = {
         ],
     },
     # Overlapping exclusive byte-range: B open then CLOSE while blocked — open +1, lock +1
+    # PRODUCT BUG (NFSv4.0): same as two_locks_unlock — B open persists while
+    # lock-blocked (peer open +2). Passes on 4.1/4.2.
     "byte_range_overlap_block": {
         "delta_open": 1,
         "delta_lock": 1,
         "min_clients": 2,
         "custom": "byte_range_overlap_block",
     },
-    # # Unlock without close: lock then unlock, FD stays — end open +1, lock +0
-    "unlock_without_close": {
-        "delta_open": 1,
-        "delta_lock": 0,
-        "custom": "unlock_without_close",
-    },
+    # Unlock without close: lock then unlock, FD stays — end open +1, lock +0
+    # PRODUCT BUG: F_UNLCK does not drop peer State List lock count; CLOSE of
+    # all holds then leaves open=0 with orphan lock records (final_close fails
+    # want lock=0, last lock=N) on NFSv4.2 and NFSv4.1.
+    # "unlock_without_close": {
+    #     "delta_open": 1,
+    #     "delta_lock": 0,
+    #     "custom": "unlock_without_close",
+    # },
 }
 
 

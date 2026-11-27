@@ -1,38 +1,16 @@
 """NFS TSM grace-period IO conflict workflows.
 
-Grace hold: spare open + iptables -I on spare client + spare NFS restart
-→ ~90s cluster grace → C1/C2 conflict checks → unblock → after-grace TSM.
+Grace hold: plant C1 (and optional sticky pre-grace) → spare open + iptables
++ freeze C1→primary (no kernel reclaim) + **primary** NFS restart → Old State
+List conflicts → C2 during grace → unblock spare → after-grace → unfreeze C1.
 
-C01..C03: C1 WRITE_ONLY; C2 RO/WO/RW blocked then completes after grace.
-C04..C06: C1 READ_ONLY; C2 RO succeeds during grace; C2 WO/RW blocked then
-          completes after grace.
-C07..C09: C1 READ_WRITE; C2 RO/WO/RW blocked then completes after grace.
-C10: C1 WO+nwlock; C2 RW blocked at open → after grace open ok; nrlock+nwlock denied.
-C11: C1 RO+nrlock; C2 RO+nrlock both succeed during grace (compatible).
-C12: C1 RO+nrlock; C2 RW blocked → after grace open ok; nwlock denied then nrlock ok.
-C13: deleg export type5; C1 WO+nwlock; C2 RW blocked → recall; nrlock+nwlock denied.
-C14: deleg export type4; C1 RO+nrlock; C2 RW blocked → nwlock denied then nrlock ok.
-C15: deleg export type4; C1 RO+nrlock; C2 RO+nrlock both succeed (deleg 1→2).
-C16: pre-grace WO+nwlock on wf0; during grace C1 WO + C2 RO conflict on wf1; after open ok.
-C17: pre-grace WO+nwlock on wf0; during grace C1 RO + C2 RO succeed on wf1 (compatible).
-C18: pre-grace WO+nwlock on wf0; during grace C1 WO + C2 RW blocked on wf1;
-     after open ok; nrlock+nwlock denied (pre-grace lock preserved).
-C19: pre-grace RO+nrlock on wf0; during grace C1 WO + C2 RW blocked on wf1;
-     after open ok; nwlock denied then nrlock success.
-C20: pre-grace WO+nwlock on wf1; during grace C2 RO blocked on same file;
-     after open ok; nrlock+nwlock denied (reclaim vs pre-grace open).
-C21: deleg export; pre-grace WO+nwlock on wf0; during C1 WO+nwlock + C2 RW on wf1;
-     after recall; nrlock+nwlock denied (sticky deleg preserved).
-C22: pre-grace C1 WO+nwlock on wf0 + C2 RO+nrlock on wf2; during C1 WO + C2 RO
-     blocked on wf1; after open ok (multi-client floor preserved).
-R01–R06 chain: keep fds across primary restarts; cumulative reclaim then
-  grace-window compatible + conflicting opens + write-deleg conflict.
-  R01–R03: plant + primary restart only (no iptables); reclaim exact TSM.
-  R04/R05: restart primary before each access op (spare+iptables on first).
-  R04: during grace C2 RO on wf0 (compatible) → open=4 lock=3
-  R05: restart again; C2 RW on wf1 blocked → after grace open=5
-  R06: deleg export; plant WO+nwlock wf3 → restart → conflict RW blocked →
-       after recall open=7 lock=4 deleg=0; nrlock+nwlock denied
+Product checks grace conflicts only against ``old_state_info`` (recovered),
+not against opens taken during the same grace window.
+
+C01..C15: C1 planted pre-grace on wf1; C2 blocked or compatible during grace.
+C16..C22: sticky pre-grace on wf0/wf2 plus C1 conflict baseline on wf1 before
+          primary restart (C20: baseline is wf1 only via skip_c1_during).
+R01–R06: keep fds across primary restarts; reclaim then grace-window access.
 """
 
 import re
@@ -46,6 +24,7 @@ from tests.nfs.lib.tsm.grace_hold import (
     hold_cluster_grace,
     release_cluster_grace,
     unblock_cluster_grace,
+    unfreeze_grace_clients,
     wait_grace_exit,
 )
 from tests.nfs.lib.tsm.helpers import (
@@ -77,7 +56,7 @@ __all__ = ["GraceCtx", "enter_grace", "run"]
 
 log = Log(__name__)
 
-TSM_PORT = 36369
+TSM_PORT = 26369
 DEFAULT_NFS_COUNT = 4
 MIN_CLIENTS = 3  # C1 + C2 + spare hold client
 SPARE_FILE_IDX = 0  # spare mount: spare0.txt
@@ -470,11 +449,13 @@ def _wait_tsm(
     timeout=60,
     want_deleg=None,
     since_skew_sec=60,
+    list_kind="state",
 ):
     """Wait for exact TSM open/lock/(optional deleg) on node_id. 0 ok, 1 fail.
 
     ``since_skew_sec``: backdate ``since`` so host-clock ``date`` vs ganesha
     container log stamps (often a few seconds behind after restart) still match.
+    ``list_kind``: ``state`` or ``old`` (recovered / old_state_info).
     """
     announce(
         f"[{label}] expect {fmt_tsm(want_open, want_lock, want_deleg)}"
@@ -492,6 +473,7 @@ def _wait_tsm(
             expect_deleg=want_deleg,
             timeout=timeout,
             node_id=node_id,
+            list_kind=list_kind,
         )
         is None
     ):
@@ -757,14 +739,14 @@ def _run_c2_locks(ctx, c2_sess, peers, node_id, tag, locks, file_idx=WF_FILE_IDX
 
 
 def tc_conflict_generic(ctx, spec, nfs_version="4.2"):
-    """One TC: optional pre-grace records; C1/C2 during grace; after-grace as needed."""
+    """One TC: plant C1 pre-grace → primary restart → C2 during grace."""
     tag = spec["id"]
     use_deleg = bool(spec.get("use_deleg_export"))
     pre_grace = spec.get("pre_grace")  # {c1_mode, c1_lock?, file_idx}
     pre_grace_c2 = spec.get("pre_grace_c2")  # {c2_mode, c2_lock?, file_idx}
     skip_c1_during = bool(spec.get("skip_c1_during"))
     c1_mode = spec.get("c1_mode", WO)
-    c1_lock = spec.get("c1_lock")  # lock during grace (C10–C15); not pre-grace
+    c1_lock = spec.get("c1_lock")  # planted with C1 before primary restart
     c2_mode = spec["c2_mode"]
     c2_expect = spec.get("c2_expect", "blocked")
     c2_lock_during = spec.get("c2_lock_during")
@@ -822,7 +804,7 @@ def tc_conflict_generic(ctx, spec, nfs_version="4.2"):
     c2_close_idxs = [WF_FILE_IDX]
     c2_unlock_idxs = []
     grace_since = None
-    # Share-access for conflict logs: pre-grace open when C1 skips during-grace open
+    # Conflict SA: C20 uses pre_grace mode on wf1; others use c1_mode on wf1.
     conflict_existing_mode = pre_mode if (skip_c1_during and pre_mode) else c1_mode
     try:
         peers = _workflow_peers(ctx)
@@ -831,8 +813,9 @@ def tc_conflict_generic(ctx, spec, nfs_version="4.2"):
             return 1
         node_id = ctx.server_node_id
         base = _file_base(mount)
+        watch = [ctx.server] + peers
 
-        # --- Optional pre-grace sticky records (C1) ---
+        # --- Optional sticky pre-grace records (C1 on other file) ---
         if pre_grace:
             c1_sess = InteractiveSession(c1, base, tag="c1")
             if not c1_sess.start():
@@ -853,9 +836,9 @@ def tc_conflict_generic(ctx, spec, nfs_version="4.2"):
                 ctx, baseline, label, open_since, use_deleg, bool(pre_lock)
             ):
                 return 1
-            log.info("[%s] → pre-grace records ok (held through grace)", label)
+            log.info("[%s] → pre-grace sticky ok", label)
 
-        # --- Optional pre-grace sticky records (C2 / multi-client) ---
+        # --- Optional sticky pre-grace records (C2 / multi-client) ---
         if pre_grace_c2:
             c2_sess = InteractiveSession(c2, base, tag="c2pre")
             if not c2_sess.start():
@@ -881,22 +864,23 @@ def tc_conflict_generic(ctx, spec, nfs_version="4.2"):
                 c2_held_lock = True
             if _hold_expect(ctx, baseline, label, open_since, False, bool(pre_c2_lock)):
                 return 1
-            log.info("[%s] → C2 pre-grace records ok (held through grace)", label)
-
-        announce(f"[{tag}] hold cluster grace (spare + iptables -I)")
-        rc, grace_since = hold_cluster_grace(ctx, spare_sess)
-        if rc:
-            return 1
+            log.info("[%s] → C2 pre-grace sticky ok", label)
 
         if not c1_sess:
             c1_sess = InteractiveSession(c1, base, tag="c1")
             if not c1_sess.start():
                 return 1
 
-        # --- C1 during grace (skipped when pre-grace already holds conflict file) ---
+        # --- C1 conflict baseline on wf1 BEFORE primary restart (→ old_state) ---
+        floor = peer_summary(peers, ctx.nfs_name, node_id=node_id) or {}
+        floor_open = int(floor.get("open", 0))
+        floor_lock = int(floor.get("lock", 0))
+        floor_deleg = int(floor.get("deleg", 0))
         if not skip_c1_during:
-            label = f"{tag} C1 during {c1_mode}" + (f"+{c1_lock}" if c1_lock else "")
-            announce(f"[{label}] open expect=success")
+            label = f"{tag} C1 pre-grace {c1_mode}" + (
+                f"+{c1_lock}" if c1_lock else ""
+            )
+            announce(f"[{label}] open expect=success (conflict baseline)")
             baseline = peer_summary(peers, ctx.nfs_name, node_id=node_id)
             open_since, _ = get_node_time(peers)
             if _open_then_lock(
@@ -914,22 +898,68 @@ def tc_conflict_generic(ctx, spec, nfs_version="4.2"):
                 ):
                     return 1
             else:
-                # With pre-grace lock held: open+1, lock unchanged (floor preserved)
                 if _tsm_expect(
                     ctx, baseline, label, open_since, True, open_delta=1, lock_delta=0
                 ):
                     return 1
-            log.info("[%s] → success (TSM Node-id %s ok)", label, node_id)
+            snap = peer_summary(peers, ctx.nfs_name, node_id=node_id)
+            floor_open = int(snap.get("open", 0))
+            floor_lock = int(snap.get("lock", 0))
+            floor_deleg = int(snap.get("deleg", 0))
+            log.info(
+                "[%s] → baseline open=%s lock=%s deleg=%s",
+                label,
+                floor_open,
+                floor_lock,
+                floor_deleg,
+            )
         else:
             announce(
-                f"[{tag}] skip C1 during-grace open "
-                f"(pre-grace holds index {pre_idx})"
+                f"[{tag}] C1 baseline already on index {pre_idx} "
+                f"(open={floor_open} lock={floor_lock})"
             )
+
+        announce(
+            f"[{tag}] hold cluster grace (spare + iptables + primary restart)"
+        )
+        # Freeze C1→primary so kernel cannot reclaim planted opens into State
+        # List; grace conflicts are checked only against old_state_info.
+        rc, grace_since = hold_cluster_grace(
+            ctx,
+            spare_sess,
+            restart_node=ctx.server,
+            freeze_clients=[c1],
+        )
+        if rc:
+            return 1
+
+        # C2 mounts primary — grace conflicts use primary Old List only.
+        reclaim_deleg = floor_deleg if use_deleg else None
+        if _wait_tsm(
+            [ctx.server],
+            ctx,
+            grace_since,
+            floor_open,
+            floor_lock,
+            f"{tag} reclaim floor",
+            node_id,
+            timeout=120,
+            want_deleg=reclaim_deleg,
+            list_kind="old",
+        ):
+            return 1
+        log.info(
+            "[%s] → reclaim floor (primary old) open=%s lock=%s deleg=%s",
+            tag,
+            floor_open,
+            floor_lock,
+            reclaim_deleg,
+        )
 
         # --- C2 during grace ---
         label = f"{tag} C2 during {c2_mode}"
         announce(f"[{label}] open expect={c2_expect}")
-        open_since, _ = get_node_time([ctx.server] + peers)
+        open_since, _ = get_node_time(watch)
         baseline = peer_summary(peers, ctx.nfs_name, node_id=node_id)
         if not c2_sess:
             c2_sess = InteractiveSession(
@@ -940,6 +970,9 @@ def tc_conflict_generic(ctx, spec, nfs_version="4.2"):
         timeout = 8 if c2_expect == "blocked" else 30
         got = c2_sess.open_file(WF_FILE_IDX, c2_mode, timeout=timeout)
         if got != c2_expect:
+            # PRODUCT BUG (observed): with C1 frozen + primary Old List floor
+            # matching planted opens, conflicting C2 OPEN still returns success
+            # during grace (old_state share conflict not enforced).
             log.error("[%s] open want=%s got=%s", label, c2_expect, got)
             return 1
 
@@ -990,6 +1023,8 @@ def tc_conflict_generic(ctx, spec, nfs_version="4.2"):
             if c2_sess.wait_opened(WF_FILE_IDX, timeout=90) != "success":
                 log.error("[%s] hanging open did not complete", label)
                 return 1
+            # C1 may reclaim now that grace ended and hanging open completed.
+            unfreeze_grace_clients(ctx)
             if _tsm_expect(
                 ctx,
                 baseline,
@@ -1037,6 +1072,7 @@ def tc_conflict_generic(ctx, spec, nfs_version="4.2"):
         # Always end grace before CLOSE (even if try returned early).
         try:
             unblock_cluster_grace(ctx)
+            unfreeze_grace_clients(ctx)
             if grace_since is not None:
                 if wait_grace_exit(ctx, grace_since, timeout=150):
                     log.warning("[%s] grace exit wait timed out before close", tag)
@@ -1162,6 +1198,23 @@ def tc_recover_primary(ctx, spec, nfs_version="4.2"):
                     return None, None, None
             return c2_sess, c2_close_idxs, c2_unlock_idxs
 
+        def _nudge_reclaim():
+            """F_GETLK on held fds so idle clients reclaim during grace."""
+            for s, idxs in (
+                (c1_sess, c1_close_idxs),
+                (c2_sess, c2_close_idxs),
+                (c1d_sess, c1d_close_idxs),
+                (c2d_sess, c2d_close_idxs),
+            ):
+                if not s or not idxs:
+                    continue
+                for i in idxs:
+                    try:
+                        s.send(f"getlk {i} w")
+                    except Exception as exc:
+                        log.warning("[%s] getlk nudge idx=%s: %s", tag, i, exc)
+            time.sleep(3)
+
         for phase in phases:
             pname = phase["name"]
             who = phase.get("who", "c1")
@@ -1196,6 +1249,8 @@ def tc_recover_primary(ctx, spec, nfs_version="4.2"):
             rc, grace_since = enter_grace(ctx, target_node=ctx.server)
             if rc:
                 return 1
+            # Idle held fds often never reclaim (server: reclaim complete(0)).
+            _nudge_reclaim()
             if _wait_tsm(
                 watch,
                 ctx,
@@ -1206,6 +1261,8 @@ def tc_recover_primary(ctx, spec, nfs_version="4.2"):
                 node_id,
                 timeout=120,
             ):
+                # PRODUCT BUG: planted open+lock remain on Old List; State stays
+                # 0 after primary restart even when reclaim complete(N) fires.
                 return 1
             log.info(
                 "[%s] → reclaim ok (open=%s lock=%s)",
@@ -1340,6 +1397,7 @@ def tc_recover_primary(ctx, spec, nfs_version="4.2"):
                     rc, grace_since = enter_grace(ctx, target_node=ctx.server)
                     if rc:
                         return 1
+                    _nudge_reclaim()
                     if _wait_tsm(
                         watch,
                         ctx,
@@ -1442,6 +1500,7 @@ def tc_recover_primary(ctx, spec, nfs_version="4.2"):
                     rc, grace_since = enter_grace(ctx, target_node=ctx.server)
                 if rc:
                     return 1
+                _nudge_reclaim()
                 if _wait_tsm(
                     watch,
                     ctx,

@@ -98,13 +98,11 @@ class NfsTsmValidation:
             has_port = self.tsm_port_key in core
             enabled = str(core.get(self.enable_tsm_key, "")).lower()
             tsm_port = str(core.get(self.tsm_port_key, ""))
-            peers = [
-                p.strip()
-                for p in conf.get("CEPH_NODES_LIST", {})
-                .get("Ceph_Nodes", "")
-                .split(",")
-                if p.strip()
-            ]
+            # Prefer Cluster_Members (current); fall back to legacy CEPH_NODES_LIST.
+            peers_raw = core.get("Cluster_Members", "") or conf.get(
+                "CEPH_NODES_LIST", {}
+            ).get("Ceph_Nodes", "")
+            peers = [p.strip() for p in str(peers_raw).split(",") if p.strip()]
             log.info(
                 "%s: %s=%s %s=%s peers=%s",
                 node.hostname,

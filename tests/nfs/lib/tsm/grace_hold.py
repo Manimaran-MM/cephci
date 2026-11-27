@@ -149,8 +149,8 @@ def grace_has_exited(ctx, since, node=None):
     return bool(hits and hits.get(primary.hostname))
 
 
-def iptables_nfs_block_spare(client, spare_nfs, nfs_port, add=True):
-    """Block/unblock NFS TCP on the spare client only."""
+def iptables_nfs_block(client, nfs_node, nfs_port, add=True):
+    """Block/unblock NFS TCP between ``client`` and ``nfs_node``."""
     if add:
         out, _ = client.exec_command(
             sudo=True, cmd="command -v iptables", check_ec=False, timeout=30
@@ -176,10 +176,10 @@ def iptables_nfs_block_spare(client, spare_nfs, nfs_port, add=True):
                 return False
 
     op = "-I" if add else "-D"
-    spare_ip = spare_nfs.ip_address
+    nfs_ip = nfs_node.ip_address
     cmd = (
-        f"iptables {op} OUTPUT -d {spare_ip} -p tcp --dport {nfs_port} -j DROP && "
-        f"iptables {op} INPUT -s {spare_ip} -p tcp --sport {nfs_port} -j DROP"
+        f"iptables {op} OUTPUT -d {nfs_ip} -p tcp --dport {nfs_port} -j DROP && "
+        f"iptables {op} INPUT -s {nfs_ip} -p tcp --sport {nfs_port} -j DROP"
     )
     try:
         client.exec_command(sudo=True, cmd=cmd, check_ec=add, timeout=60)
@@ -188,8 +188,8 @@ def iptables_nfs_block_spare(client, spare_nfs, nfs_port, add=True):
             "add" if add else "del",
             client.hostname,
             nfs_port,
-            spare_nfs.hostname,
-            spare_ip,
+            nfs_node.hostname,
+            nfs_ip,
         )
     except Exception as exc:
         log.error(
@@ -203,11 +203,19 @@ def iptables_nfs_block_spare(client, spare_nfs, nfs_port, add=True):
     return True
 
 
-def hold_cluster_grace(ctx, spare_session, restart_node=None):
+def iptables_nfs_block_spare(client, spare_nfs, nfs_port, add=True):
+    """Block/unblock NFS TCP on the spare client only."""
+    return iptables_nfs_block(client, spare_nfs, nfs_port, add=add)
+
+
+def hold_cluster_grace(ctx, spare_session, restart_node=None, freeze_clients=None):
     """Extend cluster grace (~90s): spare hold + iptables + NFS restart.
 
     restart_node: which NFS host to restart (default: spare). Pass ctx.server
     to restart the primary while spare+iptables still extends grace.
+
+    freeze_clients: optional clients to block from ``ctx.server`` for the grace
+    window (prevents kernel reclaim into State List so Old List conflicts stay).
 
     On failure after iptables/session are set, calls release_cluster_grace.
     Returns (0, grace_since) or (1, None).
@@ -219,11 +227,20 @@ def hold_cluster_grace(ctx, spare_session, restart_node=None):
     target = restart_node or ctx.spare_node
     primary = ctx.server
     ctx._spare_session = spare_session
+    ctx._freeze_clients = []
     if not iptables_nfs_block_spare(
         ctx.spare_client, ctx.spare_node, ctx.nfs_port, add=True
     ):
         return 1, None
     ctx._iptables_active = True
+
+    for cl in freeze_clients or []:
+        if not cl or cl is ctx.spare_client:
+            continue
+        if not iptables_nfs_block(cl, primary, ctx.nfs_port, add=True):
+            release_cluster_grace(ctx)
+            return 1, None
+        ctx._freeze_clients.append(cl)
 
     # Wait for new container only when restarting primary (not spare).
     wait_cid = target.hostname != ctx.spare_node.hostname
@@ -235,16 +252,21 @@ def hold_cluster_grace(ctx, spare_session, restart_node=None):
         return 1, None
 
     log.info(
-        "Cluster in grace (restart=%s spare_hold=%s primary=%s)",
+        "Cluster in grace (restart=%s spare_hold=%s primary=%s freeze=%s)",
         target.hostname,
         ctx.spare_node.hostname,
         primary.hostname,
+        ",".join(c.hostname for c in ctx._freeze_clients) or "-",
     )
     return 0, grace_since
 
 
 def unblock_cluster_grace(ctx):
-    """Remove spare-client NFS iptables only (idempotent)."""
+    """Remove spare-client NFS iptables only (idempotent).
+
+    Leaves ``_freeze_clients`` blocked so C1 cannot reclaim before a hanging
+    C2 open completes after grace; call ``unfreeze_grace_clients`` after that.
+    """
     if not (ctx.spare_node and ctx.spare_client and ctx._iptables_active):
         return
     iptables_nfs_block_spare(ctx.spare_client, ctx.spare_node, ctx.nfs_port, add=False)
@@ -252,9 +274,20 @@ def unblock_cluster_grace(ctx):
     log.info("Unblocked NFS iptables on spare client %s", ctx.spare_client.hostname)
 
 
+def unfreeze_grace_clients(ctx):
+    """Unblock clients frozen against primary (idempotent)."""
+    for cl in list(getattr(ctx, "_freeze_clients", []) or []):
+        try:
+            iptables_nfs_block(cl, ctx.server, ctx.nfs_port, add=False)
+        except Exception as exc:
+            log.warning("unfreeze %s: %s", getattr(cl, "hostname", cl), exc)
+    ctx._freeze_clients = []
+
+
 def release_cluster_grace(ctx):
     """Unblock iptables (if set), close spare open, stop session. Idempotent."""
     unblock_cluster_grace(ctx)
+    unfreeze_grace_clients(ctx)
     if ctx._spare_session is None:
         return
     try:

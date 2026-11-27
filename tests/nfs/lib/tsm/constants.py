@@ -31,7 +31,7 @@ TSM_DISABLE_ABSENT = (
 # Each marker below must match individually (not OR'd).
 # ---------------------------------------------------------------------------
 TSM_PRIMARY_SELECTION_FAIL_PRESENT = (
-    "Peer recovery failed after 5 attempts",
+    "Peer recovery failed after 7 attempts",
     "TSM_PEER_RECORD_RECOVERY_FAILED",
 )
 

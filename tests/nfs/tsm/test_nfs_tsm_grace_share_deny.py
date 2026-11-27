@@ -1,33 +1,17 @@
 """NFS TSM grace-period share-deny workflows.
 
 C1: raw NFSv4.1 OPEN via open_share.py (explicit share_access / share_deny).
-C2: kernel InteractiveSession (same as test_nfs_tsm_grace_io.py) for
-    conflicting / non-conflicting opens + locks.
-Grace hold: spare + iptables (unchanged).
+C2: kernel InteractiveSession for conflicting / non-conflicting opens + locks.
 
-Design (all TCs — do not regress):
-  1. C1 OPEN is always *during* grace (never plant-before-grace).
-  2. C2 expect values stay as in WORKFLOWS (solo-TC proven); do not
-     retarget success/denied → blocked for pre-grace planting.
+Design (aligned with TSM old_state_info grace checks):
+  1. Plant C1 OPEN *before* grace, then spare + iptables + **primary** restart
+     so C1 records recover into Old State List.
+  2. C2 expect values stay as in WORKFLOWS; do not retarget to hide product gaps.
+  3. open_share is userspace (no kernel reclaim); C1 session dies on primary
+     restart. TSM GRACE conflicts still use recovered old_state. After grace,
+     C1 is re-opened before c2_after lease-alive probes.
 
-No-deleg (*0):
-Rn0..DB0 — primary export; WANT_NO_DELEG (see WORKFLOWS).
-
-With-deleg (*4 READ / *5 WRITE) on delegations=rw + --want-deleg:
-  Locks under an active deleg are client-local (TSM lock unchanged) until
-  another client's open recalls the deleg — then lock records appear (same
-  as grace_io C13/C14). During C2 RO+nrlock: open+1 lock+0; after recall:
-  after_open_deleg_delta=-1 and optional after_open_lock_delta.
-Rn4: C1 r deny n READ; RO+nrlock close during grace; after grace RW success + recall.
-Rb4: C1 r deny b READ; RO denied; after RO/WO denied (no recall).
-Rw4: C1 r deny w READ; RO+nrlock close; WO denied (share-deny); after WO denied.
-Wn5: C1 w deny n WRITE; RO blocked → after success + recall.
-Ww5: C1 w deny w WRITE; RO blocked → after RO + recall; WO denied.
-Dn5: C1 rw deny n WRITE; RO blocked → after success + recall.
-DW5: C1 rw deny w WRITE; RO blocked → after RO + recall; WO denied.
-DR5: C1 rw deny r WRITE; WO blocked → after WO + recall; RO denied.
-DB5: C1 rw deny b WRITE; RO blocked→denied; WO denied (no recall).
-
+No-deleg (*0) / with-deleg (*4/*5): see WORKFLOWS.
 Between TCs: wait NOT IN GRACE → clean close C2/C1 → TSM drain open=0.
 """
 
@@ -69,7 +53,7 @@ from utility.log import Log
 
 log = Log(__name__)
 
-TSM_PORT = 36369
+TSM_PORT = 26369
 DEFAULT_NFS_COUNT = 4
 MIN_CLIENTS = 3  # C1 + C2 + spare
 SPARE_FILE_IDX = 0
@@ -684,14 +668,8 @@ def tc_share_deny(ctx, spec, nfs_version="4.2"):
             return 1
         ctx._spare_session = spare_sess
 
-        # Design #1: hold grace first; C1 OPEN during grace (not pre-planted).
-        announce(f"[{tag}] hold cluster grace (spare + iptables -I)")
-        rc, grace_since = hold_cluster_grace(ctx, spare_sess)
-        if rc:
-            return 1
-
-        # --- C1 during grace ---
-        label = f"{tag} C1 during {c1_access} deny {c1_deny}"
+        # --- C1 before grace (records sync → recovered old_state after restart) ---
+        label = f"{tag} C1 pre-grace {c1_access} deny {c1_deny}"
         if want_deleg:
             label += " want_deleg"
         announce(f"[{label}] open_share hold expect=success")
@@ -718,7 +696,47 @@ def tc_share_deny(ctx, spec, nfs_version="4.2"):
             deleg_delta=1 if want_deleg else None,
         ):
             return 1
-        log.info("[%s] → success (open_share hold)", label)
+        floor = peer_summary(peers, ctx.nfs_name, node_id=node_id) or {}
+        floor_open = int(floor.get("open", 0))
+        floor_lock = int(floor.get("lock", 0))
+        floor_deleg = int(floor.get("deleg", 0)) if use_deleg else None
+        log.info(
+            "[%s] → baseline open=%s lock=%s deleg=%s",
+            label,
+            floor_open,
+            floor_lock,
+            floor_deleg,
+        )
+
+        announce(
+            f"[{tag}] hold cluster grace (spare + iptables + primary restart)"
+        )
+        rc, grace_since = hold_cluster_grace(
+            ctx, spare_sess, restart_node=ctx.server
+        )
+        if rc:
+            return 1
+
+        # Peer State List still holds mirrored C1 records after primary restart.
+        announce(
+            f"[{tag}] wait reclaim/mirror floor",
+            fmt_tsm(floor_open, floor_lock, floor_deleg),
+        )
+        if (
+            wait_peer_counts(
+                peers,
+                ctx.nfs_name,
+                grace_since,
+                floor_open,
+                floor_lock,
+                f"{tag} reclaim floor",
+                expect_deleg=floor_deleg,
+                timeout=120,
+                node_id=node_id,
+            )
+            is None
+        ):
+            return 1
 
         # --- C2 during grace ---
         for i, probe in enumerate(spec.get("c2_during") or []):
@@ -907,8 +925,48 @@ def tc_share_deny(ctx, spec, nfs_version="4.2"):
 
         c2_blocked = [x for x in c2_blocked if x.get("sess")]
 
+        # Re-open C1 after grace when lease-alive probes need it (userspace
+        # open_share dies on primary restart; no kernel reclaim).
+        c2_after = list(spec.get("c2_after") or [])
+        if c2_after:
+            if c1_sess:
+                try:
+                    c1_sess.stop()
+                except Exception as exc:
+                    log.warning("[%s] stale C1 stop after restart: %s", tag, exc)
+                c1_sess = None
+            label = f"{tag} C1 re-open after grace {c1_access} deny {c1_deny}"
+            announce(f"[{label}] open_share hold expect=success")
+            baseline = peer_summary(peers, ctx.nfs_name, node_id=node_id)
+            open_since = _stamp(peers)
+            c1_sess = ShareOpenSession(
+                c1,
+                server=ctx.server.hostname,
+                port=ctx.nfs_port,
+                export=export,
+                filename=share_file,
+                tag="c1b",
+            )
+            if (
+                c1_sess.open_hold(c1_access, c1_deny, want_deleg=want_deleg)
+                != "success"
+            ):
+                log.error("[%s] C1 re-open failed", label)
+                return 1
+            if _tsm_expect(
+                ctx,
+                baseline,
+                label,
+                open_since,
+                True,
+                open_delta=1,
+                deleg_delta=1 if want_deleg else None,
+            ):
+                return 1
+            log.info("[%s] → C1 lease restored", label)
+
         # --- After grace: fresh opens ---
-        for i, probe in enumerate(spec.get("c2_after") or []):
+        for i, probe in enumerate(c2_after):
             mode = probe["mode"]
             expect = probe["expect"]
             label = f"{tag} C2 after {mode}"
@@ -975,6 +1033,13 @@ def tc_share_deny(ctx, spec, nfs_version="4.2"):
             since=drain_since,
             expect_deleg=drain_deleg,
         ):
+            # PRODUCT BUG: unreclaimed open/deleg from C1 open_share death
+            # during grace sticks on State after CLEAN_CLOSE of re-opened C1.
+            log.error(
+                "[%s] PRODUCT BUG: sticky TSM open/deleg after unreclaimed "
+                "C1 death during grace (drain did not reach open=0)",
+                tag,
+            )
             ctx.tsm_drain_failed = True
 
 
@@ -1097,6 +1162,9 @@ def run(ceph_cluster, **kw):
             if getattr(ctx, "tsm_drain_failed", False) and results[tc_id] == "passed":
                 log.error("[%s] PASSED body but TSM drain failed", tc_id)
                 results[tc_id] = "failed"
+            # Sticky unreclaimed open/deleg survives full NFS restart (RADOS/
+            # peer mirrored). One-workflow-per-run avoids cross-TC pollution;
+            # multi-workflow needs a fresh NFS cluster, not daemon restart.
             if results[tc_id] == "passed" and check_coredumps(
                 nodes, coredump_since, tc_id
             ):

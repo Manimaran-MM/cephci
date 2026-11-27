@@ -56,7 +56,8 @@ from utility.log import Log
 log = Log(__name__)
 
 NFS_NAME = "cephfs-nfs-integ"
-TSM_PORT = 36373
+# Keep TSM below ephemeral range (32768-60999) — OSD source ports collide otherwise.
+TSM_PORT = 26373
 NFS_PORT = 12053
 MONITORING_PORT = 19587
 RECOVERY_TIMEOUT = 120
@@ -79,6 +80,25 @@ def _hold_peer_tsm_delta(deleg_mode):
 HOLD_STEPS = tuple(_hold_peer_tsm_delta(m) for m in DELEG_MODES)
 
 
+def _scrub_stale_holds(clients, mounts=None):
+    """Kill leftover fcntl hold PIDs/files from prior aborted runs.
+
+    Stale F_WRLCK holders block the next exclusive_hold (open appears, lock never).
+    """
+    for i, client in enumerate(clients or []):
+        client.exec_command(
+            sudo=True,
+            cmd="pkill -9 -f 'tc_hold_|/mnt/integ_exp' 2>/dev/null || true",
+            check_ec=False,
+        )
+        if mounts and i < len(mounts) and mounts[i]:
+            client.exec_command(
+                sudo=True,
+                cmd=f"rm -f {mounts[i]}/tc_hold_*.txt 2>/dev/null || true",
+                check_ec=False,
+            )
+
+
 def _teardown_integ(ctx=None, clients=None, pool_nodes=None):
     clients = clients or (ctx.clients if ctx else [])
     pool = pool_nodes or (ctx.pool_nodes if ctx else [])
@@ -87,8 +107,11 @@ def _teardown_integ(ctx=None, clients=None, pool_nodes=None):
     if ctx:
         kill_holds(ctx.holds)
         ctx.holds.clear()
+        _scrub_stale_holds(ctx.clients, ctx.mounts)
         if ctx.mounts and ctx.exports:
             teardown_three_exports(ctx.cmd, ctx.clients, ctx.mounts, ctx.exports)
+    else:
+        _scrub_stale_holds(clients)
     safe_cleanup(
         clients[0],
         ctx.mounts[0] if ctx and ctx.mounts else FALLBACK_MOUNT,
@@ -259,6 +282,11 @@ def _prepare_tc10_placement(ctx):
 def _start_one_hold(ctx, index):
     client = ctx.clients[index]
     hold_f = f"{ctx.mounts[index]}/tc_hold_{index}.txt"
+    # Unlink any leftover file. Do NOT pre-touch on delegating exports:
+    # a short-lived open can grant+DELEGRETURN a write-deleg before the hold.
+    client.exec_command(
+        sudo=True, cmd=f"rm -f {hold_f} 2>/dev/null || true", check_ec=False
+    )
     if DELEG_MODES[index] is None:
         client.exec_command(
             sudo=True,
@@ -277,6 +305,7 @@ def _wait_nid(ctx, hosts, since, label, **expect):
 
 def setup_suite_holds(ctx):
     """Start all holds once after deploy."""
+    _scrub_stale_holds(ctx.clients, ctx.mounts)
     _refresh_active(ctx)
     ctx.hold_since, _ = get_node_time(ctx.peers)
     if resolve_server_nid(ctx, "setup") is None:
@@ -308,10 +337,24 @@ def setup_suite_holds(ctx):
 
 
 def pre_workflow(ctx, tag):
+    """Baseline check before each TC.
+
+    After primary disrupt/respawn the mount server's live State List for its
+    own Node-id is often empty (records sit on peers, or Old list locally).
+    Probe peers first — same as post_workflow — then fall back to the server.
+    """
     _refresh_active(ctx)
     ctx.mds_pre = snapshot_mds_sessions(ctx.cmd, f"{tag}:pre")
     ctx.ganesha_id = record_ganesha_id(ctx.cmd, ctx.nfs_name)
-    if _wait_nid(ctx, [ctx.server], ctx.hold_since, f"{tag}:pre") is None:
+    nid = resolve_server_nid(ctx, f"{tag}:pre")
+    if nid is None:
+        raise RuntimeError(f"[{tag}] pre-workflow: no mount-server Node-id")
+    hosts = ctx.peers or [ctx.server]
+    if _wait_nid(ctx, hosts, ctx.hold_since, f"{tag}:pre") is None:
+        if hosts is ctx.peers and _wait_nid(
+            ctx, [ctx.server], ctx.hold_since, f"{tag}:pre"
+        ):
+            return
         raise RuntimeError(f"[{tag}] pre-workflow mount-server TSM not at baseline")
 
 
@@ -337,9 +380,21 @@ def _post_peer_disrupt(ctx, tag):
             is None
         ):
             return 1
+    # After primary redeploy/restart live State List may be empty while
+    # recovered records sit on Old list — accept either as retained.
+    if _wait_nid(ctx, [ctx.server], ctx.hold_since, f"{tag}:primary-retain") is not None:
+        return 0
+    log.info("[%s] primary State List miss; trying Old State List", tag)
     return (
         0
-        if _wait_nid(ctx, [ctx.server], ctx.hold_since, f"{tag}:primary-retain")
+        if wait_server_nid_counts(
+            ctx,
+            [ctx.server],
+            ctx.disrupt_since or ctx.hold_since,
+            f"{tag}:primary-retain-old",
+            timeout=RECOVERY_TIMEOUT,
+            list_kind="old",
+        )
         is not None
         else 1
     )
@@ -356,16 +411,21 @@ def post_workflow(ctx, tag):
             nid = resolve_server_nid(ctx, f"{tag}:post")
             if nid is None:
                 return 1
-            probe = peer_summary(ctx.peers, ctx.nfs_name, since=log_since, node_id=nid)
-            hosts = ctx.peers if probe.get("seen") else [ctx.server]
-            if not probe.get("seen"):
+            # Always wait on peers for the full timeout first. An early
+            # "not seen" probe right after primary redeploy races the peer
+            # printer and wrongly falls back to an empty mount-server State
+            # List (TC-03). Peers reprint Node-id baseline within recovery.
+            if ctx.peers and _wait_nid(ctx, ctx.peers, log_since, f"{tag}:post") is None:
                 log.info(
-                    "[%s] peers have no Node-id=%s summary; checking mount server",
+                    "[%s] peers miss Node-id=%s baseline; checking mount server",
                     tag,
                     nid,
                 )
-            if _wait_nid(ctx, hosts, log_since, f"{tag}:post") is None:
-                return 1
+                if _wait_nid(ctx, [ctx.server], log_since, f"{tag}:post") is None:
+                    return 1
+            elif not ctx.peers:
+                if _wait_nid(ctx, [ctx.server], log_since, f"{tag}:post") is None:
+                    return 1
         if assert_ganesha_id_unchanged(
             ctx.ganesha_id, record_ganesha_id(ctx.cmd, ctx.nfs_name), tag
         ):
@@ -521,6 +581,9 @@ WORKFLOWS = {
     ),
     "TC-07": ("MDS failover + grace", tc_07_mds_failover),
     "TC-08": ("Reboot mount server", _reboot_mount_server),
+    # PRODUCT BUG: after peer reboot cephadm/ganesha may remapping NFS_Port /
+    # Tsm_Port (e.g. 12053→12054, 26373→26374) and RADOS nodeid; assert_tsm_ready
+    # then fails on expected Tsm_Port. State retain (Old list) still OK.
     "TC-09": ("Reboot peer nfs nodes", tc_09_reboot_peers),
     "TC-10": ("Reboot mount server (4-host pool)", _reboot_mount_server),
 }

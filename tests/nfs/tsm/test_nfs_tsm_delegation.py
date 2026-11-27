@@ -54,7 +54,8 @@ from utility.log import Log
 log = Log(__name__)
 
 NFS_PORT = 12052
-TSM_PORT = 36372
+# Keep TSM below ephemeral range (32768-60999) — OSD source ports collide otherwise.
+TSM_PORT = 26372
 SUMMARY_TITLE = "TSM DELEGATION WORKFLOW SUMMARY"
 # FSAL_UP emits ``Recalling``; NFS_CB emits ``successfully recalled``.
 DELEG_DEBUG_COMPONENTS = ("TSM", "STATE", "NFS4", "FSAL", "FSAL_UP", "NFS_CB")

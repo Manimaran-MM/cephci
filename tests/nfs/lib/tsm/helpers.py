@@ -25,7 +25,13 @@ NODE_SUMMARY_RE = re.compile(
     r"total=(\d+) open=(\d+) lock=(\d+) deleg=(\d+)",
     re.I,
 )
+# Periodic printer tags State List (live) then Old State List (recovered).
+LIST_TAG_RE = re.compile(
+    r"Node\s*id:\s*(-?\d+)\s+Printing the (State List|Old State List)",
+    re.I,
+)
 GANESHA_ID_RE = re.compile(r"Ganesha ID:\s*(\d+)", re.I)
+_LIST_KIND = {"state": "state list", "old": "old state list"}
 POLL_TIMEOUT = 90
 POLL_INTERVAL = 3
 COREDUMP_PATH = "/var/lib/systemd/coredump"
@@ -133,34 +139,88 @@ def resolve_server_nid(ctx, label=""):
     return None
 
 
-def peer_summary(peers, nfs_name, since=None, node_id=None):
-    """Last peer TSM summary from ``podman logs``.
+def peer_summary(peers, nfs_name, since=None, node_id=None, list_kind="state"):
+    """Latest peer TSM summary from ``podman logs``.
 
-    If ``node_id`` is set, only match that Node-id record.
+    ``list_kind``: ``state`` (live State List, default) or ``old`` (Old State
+    List / recovered). Summaries are bound to the preceding
+    ``Printing the State/Old State List`` tag so an empty Old list cannot
+    overwrite live State counts for the same Node-id.
+
+    If ``node_id`` is set, only that Node-id's last matching record is used.
+    Otherwise prefer remote ids (exclude the peer's own Ganesha ID and ``-1``).
     """
+    want = _LIST_KIND.get(list_kind, "state list")
     counts = {"total": 0, "open": 0, "lock": 0, "deleg": 0, "seen": False}
     for node in peers:
         _, out = _podman_logs(node, nfs_name, since=since)
-        lines = [ln for ln in out.splitlines() if SUMMARY_RE.search(ln)]
-        matched, last_m = [], None
+        # Last (line, vals) per Node-id for the requested list only.
+        by_nid = {}
+        plain = []
+        local_id = None
+        cur_list = None  # last Printing-the tag seen (any node)
+        for ln in out.splitlines():
+            gm = GANESHA_ID_RE.search(ln)
+            if gm:
+                local_id = int(gm.group(1))
+            tag = LIST_TAG_RE.search(ln)
+            if tag:
+                cur_list = tag.group(2).lower()
+                continue
+            nm = NODE_SUMMARY_RE.search(ln)
+            if nm:
+                if cur_list and cur_list != want:
+                    continue
+                # Untagged summary (legacy): treat as state list only.
+                if not cur_list and want != "state list":
+                    continue
+                nid = int(nm.group(1))
+                by_nid[nid] = (ln, nm.group(2, 3, 4, 5))
+                plain.append(ln)
+            elif SUMMARY_RE.search(ln):
+                if cur_list and cur_list != want:
+                    continue
+                if not cur_list and want != "state list":
+                    continue
+                plain.append(ln)
+
         if node_id is not None:
-            for ln in lines:
-                nm = NODE_SUMMARY_RE.search(ln)
-                if nm and int(nm.group(1)) == int(node_id):
-                    matched.append(ln)
-                    last_m = nm
-            lines = matched
+            entry = by_nid.get(int(node_id))
+            display = [entry[0]] if entry else []
+            log.info(
+                "TSM %s on %s (Node-id %s):\n%s",
+                want,
+                node.hostname,
+                node_id,
+                "\n".join(display) if display else "<none>",
+            )
+            if entry:
+                _bump_counts(counts, *entry[1])
+            continue
+
+        candidates = {
+            nid: vals
+            for nid, (_ln, vals) in by_nid.items()
+            if nid >= 0 and (local_id is None or nid != local_id)
+        }
+        if not candidates:
+            candidates = {
+                nid: vals for nid, (_ln, vals) in by_nid.items() if nid >= 0
+            }
+        display = [by_nid[nid][0] for nid in sorted(candidates)][-3:]
+        if not display:
+            display = plain[-3:]
         log.info(
-            "TSM record summary on %s%s:\n%s",
+            "TSM %s on %s:\n%s",
+            want,
             node.hostname,
-            " (Node-id %s)" % node_id if node_id is not None else "",
-            "\n".join(lines[-3:]) if lines else "<none>",
+            "\n".join(display) if display else "<none>",
         )
-        if node_id is not None:
-            if last_m:
-                _bump_counts(counts, *last_m.group(2, 3, 4, 5))
-        elif lines:
-            m = SUMMARY_RE.search(lines[-1])
+        if candidates:
+            for vals in candidates.values():
+                _bump_counts(counts, *vals)
+        elif plain:
+            m = SUMMARY_RE.search(plain[-1])
             if m:
                 _bump_counts(counts, *m.group(1, 2, 3, 4))
     return counts
@@ -178,6 +238,7 @@ def wait_peer_counts(
     interval=POLL_INTERVAL,
     raise_on_timeout=False,
     node_id=None,
+    list_kind="state",
 ):
     """Poll until peer open/lock/(optional deleg) match.
 
@@ -189,7 +250,9 @@ def wait_peer_counts(
     nid_s = f" Node-id={node_id}" if node_id is not None else ""
 
     while time.time() < deadline:
-        last = peer_summary(peers, nfs_name, since=since, node_id=node_id)
+        last = peer_summary(
+            peers, nfs_name, since=since, node_id=node_id, list_kind=list_kind
+        )
         if (
             last.get("seen")
             and last["open"] == expect_open
@@ -201,10 +264,11 @@ def wait_peer_counts(
         time.sleep(interval)
 
     log.error(
-        "[%s] peer summary timeout: want %s node_id=%s last=%s",
+        "[%s] peer summary timeout: want %s node_id=%s list=%s last=%s",
         label,
         want,
         node_id,
+        list_kind,
         last,
     )
     if raise_on_timeout:
@@ -222,6 +286,7 @@ def wait_counts_ok(
     expect_deleg=None,
     timeout=POLL_TIMEOUT,
     node_id=None,
+    list_kind="state",
 ):
     """Like ``wait_peer_counts`` but return 0 ok / 1 timeout."""
     return (
@@ -236,6 +301,7 @@ def wait_counts_ok(
             expect_deleg=expect_deleg,
             timeout=timeout,
             node_id=node_id,
+            list_kind=list_kind,
         )
         is not None
         else 1
@@ -251,6 +317,7 @@ def wait_server_nid_counts(
     expect_lock=None,
     expect_deleg=None,
     timeout=POLL_TIMEOUT,
+    list_kind="state",
 ):
     """Wait for counts on mount-server Node-id; defaults from ``ctx.want_tsm``."""
     w = getattr(ctx, "want_tsm", None) or {}
@@ -270,6 +337,7 @@ def wait_server_nid_counts(
         expect_deleg=deleg_c,
         timeout=timeout,
         node_id=nid,
+        list_kind=list_kind,
     )
 
 

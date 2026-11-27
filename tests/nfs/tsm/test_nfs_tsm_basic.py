@@ -37,24 +37,29 @@ WORKFLOWS = {
     "basic": [{}],
     "placement_hosts": [{"placement": "hosts"}],
     "placement_count": [{"placement": "count", "nfs_count": 2, "min_nfs_nodes": 3}],
-    "custom_ports": [{"nfs_port": 12049, "tsm_port": 36370}],
+    # Keep Tsm_Port below ephemeral range (32768-60999) — OSD source ports collide.
+    "custom_ports": [{"nfs_port": 12049, "tsm_port": 26370}],
     "tsm_disabled": [
         {"enable_tsm": False, "expect_enabled": None, "check_peers": False}
     ],
+    # PRODUCT BUG (ganesha 4af4f798 / IBMCEPH TSM): disable→enable flip redeploy
+    # leaves both nodes with TSM_PEER_RECORD_RECOVERY_FAILED (no FIRST_BOOT_DONE /
+    # RECOVERY_DONE) even though enable_TSM/Tsm_Port render correctly. Keep case
+    # enabled so the product gap stays visible; do not soften boot-log asserts.
     "tsm_enable_flip": [
         {"enable_tsm": False, "expect_enabled": None, "check_peers": False},
         {"enable_tsm": True, "expect_enabled": True, "check_peers": True},
     ],
     "redeploy_tsm_port": [
-        {"tsm_port": 36369},
-        {"tsm_port": 36371},
+        {"tsm_port": 26369},
+        {"tsm_port": 26371},
     ],
     "colocation": [
         {
             "second_cluster": {
                 "name": "cephfs-nfs-tsmb-b",
                 "nfs_port": 2050,
-                "tsm_port": 36370,
+                "tsm_port": 26370,
                 "export": "/export_tsmb_b",
                 "mount": "/mnt/nfs_tsmb_b",
             }
@@ -116,7 +121,7 @@ def deploy_step(cluster, installer, client, nodes, step, nfs_name, tag):
     """
     count = step.get("nfs_count", 2)
     nfs_port = step.get("nfs_port", 2049)
-    tsm_port = step.get("tsm_port", 36369)
+    tsm_port = step.get("tsm_port", 26369)
     monitoring_port = step.get("monitoring_port")
     enable_tsm = step.get("enable_tsm", True)
     enable_debug = step.get("enable_debug", True)
@@ -291,7 +296,8 @@ def run_workflow(cluster, installer, client, all_nodes, name, steps, nfs_version
     recreate = any(s.get("recreate") for s in steps)
 
     def once(tag):
-        coredump_since, _ = get_node_time(nodes)
+        # get_node_time → (log_since, coredump_since); coredump check needs datetime.
+        _, coredump_since = get_node_time(nodes)
         active, nfs_port, second = nodes, 2049, None
         for i, step in enumerate(steps):
             result = deploy_step(

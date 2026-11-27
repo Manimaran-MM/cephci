@@ -29,7 +29,8 @@ from utility.log import Log
 
 log = Log(__name__)
 
-TSM_PORT = 36369
+# Keep TSM below ephemeral range (32768-60999) — OSD source ports collide otherwise.
+TSM_PORT = 26369
 
 WORKFLOWS = {
     "single_daemon": [{"nfs_count": 1, "expect_deploy_fail": True}],
@@ -94,11 +95,15 @@ def _iptables_tsm(peers, recovering, port, add=True):
     op = "-I" if add else "-D"
     for peer in peers:
         try:
+            # REJECT (tcp-reset) so TSM connect fails fast; DROP stalls retries
+            # for minutes per attempt and blows past disable-marker waits.
             peer.exec_command(
                 sudo=True,
                 cmd=(
-                    f"iptables {op} INPUT -p tcp -s {ip} --dport {port} -j DROP && "
-                    f"iptables {op} OUTPUT -p tcp -d {ip} --dport {port} -j DROP"
+                    f"iptables {op} INPUT -p tcp -s {ip} --dport {port} "
+                    f"-j REJECT --reject-with tcp-reset && "
+                    f"iptables {op} OUTPUT -p tcp -d {ip} --dport {port} "
+                    f"-j REJECT --reject-with tcp-reset"
                 ),
                 check_ec=add,
             )
@@ -113,6 +118,16 @@ def _iptables_tsm(peers, recovering, port, add=True):
                 return False
 
     if not add:
+        # Also drop any leftover DROP rules from older runs.
+        for peer in peers:
+            peer.exec_command(
+                sudo=True,
+                cmd=(
+                    f"iptables -D INPUT -p tcp -s {ip} --dport {port} -j DROP; "
+                    f"iptables -D OUTPUT -p tcp -d {ip} --dport {port} -j DROP"
+                ),
+                check_ec=False,
+            )
         return True
 
     for peer in peers:

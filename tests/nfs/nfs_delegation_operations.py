@@ -105,8 +105,8 @@ def delegation_supported_for_rhbuild(rhbuild: Optional[str]) -> bool:
     Return True when *rhbuild* (--rhbuild / config rhbuild) is RHCS 9.1+.
 
     ``run.py`` sets ``config['rhbuild']`` to ``{rhbuild}-{platform}`` (e.g.
-    ``9.1-rhel-9``). Values with major version >= 10 are treated as upstream Ceph
-    and compared against ``DELEGATION_MIN_UPSTREAM_BUILD``.
+    ``9.1-rhel-9``, ``10.0-rhel-10``). Product majors 9.x/10.x use the RHCS
+    gate; upstream Ceph builds (major >= 20) use ``DELEGATION_MIN_UPSTREAM_BUILD``.
     """
     if not rhbuild:
         return False
@@ -118,7 +118,8 @@ def delegation_supported_for_rhbuild(rhbuild: Optional[str]) -> bool:
         return False
     major = int(major_str)
     lv = LooseVersion(token)
-    if major < 10:
+    # RHCS/IBM product line is 5..10(+); upstream Ceph versions are 15+/20+.
+    if major < 20:
         return lv >= LooseVersion(DELEGATION_MIN_RHCS_BUILD)
     return lv >= LooseVersion(DELEGATION_MIN_UPSTREAM_BUILD)
 
